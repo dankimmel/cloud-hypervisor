@@ -2156,6 +2156,7 @@ impl FsConfig {
     pub const SYNTAX: &'static str = "virtio-fs parameters \
     \"tag=<tag_name>,socket=<socket_path>,num_queues=<number_of_queues>,\
     queue_size=<size_of_each_queue>,id=<device_id>,\
+    bounce=on|off,bounce_pool_size=<bytes>,\
     pci_segment=<segment_id>,pci_device_id=<pci_slot>\"";
 
     pub fn parse(fs: &str) -> Result<Self> {
@@ -2165,6 +2166,8 @@ impl FsConfig {
             .add("queue_size")
             .add("num_queues")
             .add("socket")
+            .add("bounce")
+            .add("bounce_pool_size")
             .add_all(PciDeviceCommonConfig::OPTIONS);
         parser.parse(fs).map_err(Error::ParseFileSystem)?;
 
@@ -2182,6 +2185,15 @@ impl FsConfig {
             .convert("num_queues")
             .map_err(Error::ParseFileSystem)?
             .unwrap_or_else(default_fsconfig_num_queues);
+        let bounce = parser
+            .convert::<Toggle>("bounce")
+            .map_err(Error::ParseFileSystem)?
+            .unwrap_or(Toggle(false))
+            .0;
+        let bounce_pool_size = parser
+            .convert::<ByteSized>("bounce_pool_size")
+            .map_err(Error::ParseFileSystem)?
+            .map(|b| b.0);
 
         let pci_common = PciDeviceCommonConfig::parse(fs)?;
 
@@ -2191,6 +2203,8 @@ impl FsConfig {
             socket,
             num_queues,
             queue_size,
+            bounce,
+            bounce_pool_size,
         })
     }
 
@@ -2204,7 +2218,13 @@ impl FsConfig {
 
         validate_queue_size(self.queue_size)?;
 
+        if self.bounce_pool_size.is_some() && !self.bounce {
+            return Err(ValidationError::BouncePoolSizeRequiresBounce);
+        }
+
         if self.pci_common.iommu {
+            // virtio-fs never supports a vIOMMU, so bounce=on with iommu
+            // is rejected here just as the non-bounce case is.
             return Err(ValidationError::IommuNotSupported);
         }
 
@@ -4641,6 +4661,8 @@ mod unit_tests {
             tag: "mytag".to_owned(),
             num_queues: 1,
             queue_size: 1024,
+            bounce: false,
+            bounce_pool_size: None,
         }
     }
 
@@ -4660,6 +4682,25 @@ mod unit_tests {
             }
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_fs_bounce() -> Result<()> {
+        let cfg = FsConfig::parse("tag=t,socket=/s,bounce=on,bounce_pool_size=32M")?;
+        assert!(cfg.bounce);
+        assert_eq!(cfg.bounce_pool_size, Some(32 << 20));
+
+        let vm_config = valid_vm_config();
+        // A bounce fs device validates (no vhost_user flag to gate on).
+        cfg.validate(&vm_config).unwrap();
+
+        // bounce_pool_size without bounce is rejected.
+        let cfg = FsConfig::parse("tag=t,socket=/s,bounce_pool_size=8M")?;
+        assert!(matches!(
+            cfg.validate(&vm_config),
+            Err(ValidationError::BouncePoolSizeRequiresBounce)
+        ));
         Ok(())
     }
 

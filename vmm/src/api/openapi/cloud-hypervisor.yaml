@@ -1180,6 +1180,12 @@ components:
         queue_size:
           type: integer
           default: 1024
+        bounce:
+          type: boolean
+          default: false
+        bounce_pool_size:
+          type: integer
+          format: int64
         pci_segment:
           type: integer
           format: int16

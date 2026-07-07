@@ -22,6 +22,7 @@ use super::vu_common_ctrl::VhostUserHandle;
 use super::{DEFAULT_VIRTIO_FEATURES, Error, Result};
 use crate::device::ActivationContext;
 use crate::seccomp_filters::Thread;
+use crate::vhost_user::bounce::{BounceConfig, BounceState, mask_bounce_features};
 use crate::vhost_user::{VhostUserCommon, VhostUserState};
 use crate::{
     ActivateResult, GuestRegionMmap, MmapRegion, VIRTIO_F_ACCESS_PLATFORM, VirtioCommon,
@@ -84,9 +85,17 @@ impl Fs {
         exit_evt: EventFd,
         access_platform_enabled: bool,
         state: Option<State>,
+        bounce: Option<BounceConfig>,
     ) -> Result<Fs> {
         // Calculate the actual number of queues needed.
         let num_queues = NUM_QUEUE_OFFSET + req_num_queues;
+
+        // Create the bounce pool up front (sized for the transport-maximum
+        // queue size), independent of restore.
+        let bounce = bounce
+            .map(|cfg| BounceState::new(&cfg, num_queues, queue_size))
+            .transpose()
+            .map_err(Error::Bounce)?;
 
         // Connect to the vhost-user socket.
         let mut vu =
@@ -121,7 +130,11 @@ impl Fs {
             )
         } else {
             // Filling device and vring features VMM supports.
-            let avail_features = DEFAULT_VIRTIO_FEATURES;
+            let avail_features = if bounce.is_some() {
+                mask_bounce_features(DEFAULT_VIRTIO_FEATURES)
+            } else {
+                DEFAULT_VIRTIO_FEATURES
+            };
 
             let avail_protocol_features = VhostUserProtocolFeatures::MQ
                 | VhostUserProtocolFeatures::CONFIGURE_MEM_SLOTS
@@ -192,6 +205,7 @@ impl Fs {
                 socket_path: path.to_string(),
                 vu_num_queues,
                 vring_bases,
+                bounce,
                 ..Default::default()
             },
             id,
@@ -251,11 +265,21 @@ impl VirtioDevice for Fs {
             .activate(&queues, interrupt_cb.clone())?;
 
         let backend_req_handler: Option<FrontendReqHandler<BackendReqHandler>> = None;
+
+        // In bounce mode a second thread runs the data plane, so the pause
+        // barrier must account for the main thread plus both workers.
+        let bounce_evts = if self.vu_common.bounce.is_some() {
+            self.vu_common.virtio_common.paused_sync = Some(Arc::new(Barrier::new(3)));
+            Some(self.vu_common.virtio_common.dup_eventfds()?)
+        } else {
+            None
+        };
+
         // Run a dedicated thread for handling potential reconnections with
         // the backend.
         let (kill_evt, pause_evt) = self.vu_common.virtio_common.dup_eventfds()?;
 
-        let (mut handler, _bounce_handler) = self.vu_common.activate(
+        let (mut handler, bounce_handler) = self.vu_common.activate(
             mem,
             &queues,
             interrupt_cb.clone(),
@@ -263,11 +287,25 @@ impl VirtioDevice for Fs {
             backend_req_handler,
             kill_evt,
             pause_evt,
-            None,
+            bounce_evts,
         )?;
 
         let paused = self.vu_common.virtio_common.paused.clone();
         let paused_sync = self.vu_common.virtio_common.paused_sync.clone();
+
+        if let Some(mut bounce_handler) = bounce_handler {
+            let paused = paused.clone();
+            let paused_sync = paused_sync.clone();
+            self.vu_common.spawn_worker(
+                &format!("{}_bounce", self.id),
+                &self.seccomp_action,
+                Thread::VirtioVhostFs,
+                &self.exit_evt,
+                device_status.clone(),
+                interrupt_cb.clone(),
+                move || bounce_handler.run(&paused, paused_sync.as_ref().unwrap()),
+            )?;
+        }
 
         self.vu_common.spawn_worker(
             &self.id,

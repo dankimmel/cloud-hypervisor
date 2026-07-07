@@ -3292,6 +3292,11 @@ impl DeviceManager {
                     self.force_access_platform,
                     state_from_id(snapshot, id.as_str())
                         .map_err(DeviceManagerError::RestoreGetState)?,
+                    fs_cfg
+                        .bounce
+                        .then(|| virtio_devices::vhost_user::bounce::BounceConfig {
+                            pool_size: fs_cfg.bounce_pool_size,
+                        }),
                 )
                 .map_err(DeviceManagerError::CreateVirtioFs)?,
             ));
