@@ -633,6 +633,14 @@ pub struct GenericVhostUserConfig {
     pub socket: PathBuf,
     pub queue_sizes: Vec<u16>,
     pub device_type: u32,
+    /// Route this device's I/O through a VMM-managed bounce buffer pool
+    /// instead of sharing guest RAM with the backend.
+    #[serde(default)]
+    pub bounce: bool,
+    /// Optional bounce pool buffer-arena size in bytes (default sizing
+    /// when unset). Only meaningful with `bounce=on`.
+    #[serde(default)]
+    pub bounce_pool_size: Option<u64>,
 }
 
 impl ApplyLandlock for GenericVhostUserConfig {

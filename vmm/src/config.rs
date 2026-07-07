@@ -2065,7 +2065,7 @@ impl GenericVhostUserConfig {
     pub const SYNTAX: &'static str = "generic vhost-user parameters \
     \"virtio_id=<ID number for virtio device type (FS, block, net, etc) or symbolic name>,\
     socket=<socket_path>,\
-    queue_sizes=<list of queue sizes>,\
+    queue_sizes=<list of queue sizes>,bounce=on|off,bounce_pool_size=<bytes>,\
     id=<device_id>,pci_segment=<segment_id>,pci_device_id=<pci_slot>\"";
 
     pub fn parse(vhost_user: &str) -> Result<Self> {
@@ -2074,6 +2074,8 @@ impl GenericVhostUserConfig {
             .add("virtio_id")
             .add("queue_sizes")
             .add("socket")
+            .add("bounce")
+            .add("bounce_pool_size")
             .add_all(PciDeviceCommonConfig::OPTIONS);
         parser
             .parse(vhost_user)
@@ -2082,6 +2084,15 @@ impl GenericVhostUserConfig {
         let socket = parser
             .get("socket")
             .ok_or(Error::ParseGenericVhostUserSockMissing)?;
+        let bounce = parser
+            .convert::<Toggle>("bounce")
+            .map_err(Error::ParseGenericVhostUser)?
+            .unwrap_or(Toggle(false))
+            .0;
+        let bounce_pool_size = parser
+            .convert::<ByteSized>("bounce_pool_size")
+            .map_err(Error::ParseGenericVhostUser)?
+            .map(|b| b.0);
 
         let IntegerList(queue_sizes) = parser
             .convert::<IntegerList<u16>>("queue_sizes")
@@ -2164,12 +2175,20 @@ impl GenericVhostUserConfig {
             socket: socket.into(),
             device_type,
             queue_sizes,
+            bounce,
+            bounce_pool_size,
         })
     }
 
     pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
         if self.pci_common.iommu {
+            // Generic vhost-user never supports a vIOMMU, so bounce=on
+            // with iommu is rejected here just as the non-bounce case is.
             return Err(ValidationError::IommuNotSupported);
+        }
+
+        if self.bounce_pool_size.is_some() && !self.bounce {
+            return Err(ValidationError::BouncePoolSizeRequiresBounce);
         }
 
         for &queue_size in &self.queue_sizes {
@@ -4788,11 +4807,32 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                         .iter()
                         .map(|&f| u16::try_from(f).unwrap())
                         .collect(),
+                    bounce: false,
+                    bounce_pool_size: None,
                 }
             );
         } else {
             config.unwrap_err();
         }
+    }
+
+    #[test]
+    fn test_generic_vhost_user_bounce() -> Result<()> {
+        let cfg = GenericVhostUserConfig::parse(
+            "virtio_id=fs,socket=/s,queue_sizes=[256],bounce=on,bounce_pool_size=8M",
+        )?;
+        assert!(cfg.bounce);
+        assert_eq!(cfg.bounce_pool_size, Some(8 << 20));
+        cfg.validate(&valid_vm_config()).unwrap();
+
+        let cfg = GenericVhostUserConfig::parse(
+            "virtio_id=fs,socket=/s,queue_sizes=[256],bounce_pool_size=8M",
+        )?;
+        assert!(matches!(
+            cfg.validate(&valid_vm_config()),
+            Err(ValidationError::BouncePoolSizeRequiresBounce)
+        ));
+        Ok(())
     }
 
     #[test]

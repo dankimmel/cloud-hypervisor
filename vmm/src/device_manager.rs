@@ -3225,6 +3225,11 @@ impl DeviceManager {
                     self.force_access_platform,
                     state_from_id(snapshot, id.as_str())
                         .map_err(DeviceManagerError::RestoreGetState)?,
+                    generic_vhost_user_cfg.bounce.then(|| {
+                        virtio_devices::vhost_user::bounce::BounceConfig {
+                            pool_size: generic_vhost_user_cfg.bounce_pool_size,
+                        }
+                    }),
                 )
                 .map_err(DeviceManagerError::CreateGenericVhostUser)?,
             ));
