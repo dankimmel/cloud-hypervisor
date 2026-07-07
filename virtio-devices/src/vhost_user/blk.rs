@@ -27,12 +27,40 @@ use super::vu_common_ctrl::{VhostUserConfig, VhostUserHandle};
 use super::{DEFAULT_VIRTIO_FEATURES, Error, Result};
 use crate::device::ActivationContext;
 use crate::seccomp_filters::Thread;
+use crate::vhost_user::bounce::{BounceState, mask_bounce_features};
 use crate::vhost_user::{VhostUserCommon, VhostUserState};
 use crate::{GuestRegionMmap, VIRTIO_F_ACCESS_PLATFORM};
 
 const DEFAULT_QUEUE_NUMBER: usize = 1;
 
 pub type State = VhostUserState<VirtioBlockConfig>;
+
+/// The virtio features a vhost-user-blk device offers. When `bounce` is
+/// enabled the ring features unsupported by the bounce path are masked
+/// off before negotiation.
+fn blk_avail_features(num_queues: usize, bounce: bool) -> u64 {
+    let mut avail_features = (1 << VIRTIO_BLK_F_SIZE_MAX)
+        | (1 << VIRTIO_BLK_F_SEG_MAX)
+        | (1 << VIRTIO_BLK_F_GEOMETRY)
+        | (1 << VIRTIO_BLK_F_RO)
+        | (1 << VIRTIO_BLK_F_BLK_SIZE)
+        | (1 << VIRTIO_BLK_F_FLUSH)
+        | (1 << VIRTIO_BLK_F_TOPOLOGY)
+        | (1 << VIRTIO_BLK_F_CONFIG_WCE)
+        | (1 << VIRTIO_BLK_F_DISCARD)
+        | (1 << VIRTIO_BLK_F_WRITE_ZEROES)
+        | DEFAULT_VIRTIO_FEATURES;
+
+    if num_queues > 1 {
+        avail_features |= 1 << VIRTIO_BLK_F_MQ;
+    }
+
+    if bounce {
+        avail_features = mask_bounce_features(avail_features);
+    }
+
+    avail_features
+}
 
 struct BackendReqHandler {}
 impl VhostUserFrontendReqHandler for BackendReqHandler {}
@@ -57,6 +85,15 @@ impl Blk {
         state: Option<State>,
     ) -> Result<Blk> {
         let num_queues = vu_cfg.num_queues;
+
+        // The bounce pool (if enabled) is sized for the transport-maximum
+        // queue size and created up front, independent of restore.
+        let bounce = match &vu_cfg.bounce {
+            Some(cfg) => {
+                Some(BounceState::new(cfg, num_queues, vu_cfg.queue_size).map_err(Error::Bounce)?)
+            }
+            None => None,
+        };
 
         let mut vu = VhostUserHandle::connect_vhost_user(
             false,
@@ -95,21 +132,7 @@ impl Blk {
             )
         } else {
             // Filling device and vring features VMM supports.
-            let mut avail_features = (1 << VIRTIO_BLK_F_SIZE_MAX)
-                | (1 << VIRTIO_BLK_F_SEG_MAX)
-                | (1 << VIRTIO_BLK_F_GEOMETRY)
-                | (1 << VIRTIO_BLK_F_RO)
-                | (1 << VIRTIO_BLK_F_BLK_SIZE)
-                | (1 << VIRTIO_BLK_F_FLUSH)
-                | (1 << VIRTIO_BLK_F_TOPOLOGY)
-                | (1 << VIRTIO_BLK_F_CONFIG_WCE)
-                | (1 << VIRTIO_BLK_F_DISCARD)
-                | (1 << VIRTIO_BLK_F_WRITE_ZEROES)
-                | DEFAULT_VIRTIO_FEATURES;
-
-            if num_queues > 1 {
-                avail_features |= 1 << VIRTIO_BLK_F_MQ;
-            }
+            let avail_features = blk_avail_features(num_queues, vu_cfg.bounce.is_some());
 
             let avail_protocol_features = VhostUserProtocolFeatures::CONFIG
                 | VhostUserProtocolFeatures::MQ
@@ -187,6 +210,7 @@ impl Blk {
                 socket_path: vu_cfg.socket,
                 vu_num_queues,
                 vring_bases,
+                bounce,
                 ..Default::default()
             },
             id,
@@ -276,11 +300,20 @@ impl VirtioDevice for Blk {
 
         let backend_req_handler: Option<FrontendReqHandler<BackendReqHandler>> = None;
 
+        // In bounce mode a second thread runs the data plane, so the pause
+        // barrier must account for the main thread plus both workers.
+        let bounce_evts = if self.vu_common.bounce.is_some() {
+            self.vu_common.virtio_common.paused_sync = Some(Arc::new(Barrier::new(3)));
+            Some(self.vu_common.virtio_common.dup_eventfds()?)
+        } else {
+            None
+        };
+
         // Run a dedicated thread for handling potential reconnections with
         // the backend.
         let (kill_evt, pause_evt) = self.vu_common.virtio_common.dup_eventfds()?;
 
-        let (mut handler, _bounce_handler) = self.vu_common.activate(
+        let (mut handler, bounce_handler) = self.vu_common.activate(
             mem,
             &queues,
             interrupt_cb.clone(),
@@ -288,11 +321,27 @@ impl VirtioDevice for Blk {
             backend_req_handler,
             kill_evt,
             pause_evt,
-            None,
+            bounce_evts,
         )?;
 
         let paused = self.vu_common.virtio_common.paused.clone();
         let paused_sync = self.vu_common.virtio_common.paused_sync.clone();
+
+        // Spawn the bounce data-plane worker first so it is ready to serve
+        // the guest before the reconnection thread enables the backend.
+        if let Some(mut bounce_handler) = bounce_handler {
+            let paused = paused.clone();
+            let paused_sync = paused_sync.clone();
+            self.vu_common.spawn_worker(
+                &format!("{}_bounce", self.id),
+                &self.seccomp_action,
+                Thread::VirtioVhostBlock,
+                &self.exit_evt,
+                device_status.clone(),
+                interrupt_cb.clone(),
+                move || bounce_handler.run(&paused, paused_sync.as_ref().unwrap()),
+            )?;
+        }
 
         self.vu_common.spawn_worker(
             &self.id,
@@ -365,5 +414,27 @@ impl Migratable for Blk {
 
     fn complete_migration(&mut self) -> result::Result<(), MigratableError> {
         self.vu_common.complete_migration()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blk_avail_features_masks_ring_bits_when_bounce() {
+        let plain = blk_avail_features(4, false);
+        let bounced = blk_avail_features(4, true);
+        // Bounce clears exactly the features mask_bounce_features clears.
+        assert_eq!(bounced, mask_bounce_features(plain));
+        // Multi-queue keeps the MQ bit; the ring bits are gone.
+        assert_ne!(bounced & (1 << VIRTIO_BLK_F_MQ), 0);
+        assert_eq!(bounced & (1 << crate::VIRTIO_F_RING_INDIRECT_DESC), 0);
+        assert_eq!(bounced & (1 << crate::VIRTIO_F_RING_EVENT_IDX), 0);
+    }
+
+    #[test]
+    fn blk_avail_features_single_queue_has_no_mq() {
+        assert_eq!(blk_avail_features(1, false) & (1 << VIRTIO_BLK_F_MQ), 0);
     }
 }

@@ -88,6 +88,9 @@ pub struct VhostUserConfig {
     pub socket: String,
     pub num_queues: usize,
     pub queue_size: u16,
+    /// When set, run this device through a bounce buffer pool instead of
+    /// sharing guest RAM with the backend.
+    pub bounce: Option<super::bounce::BounceConfig>,
 }
 
 #[derive(Clone)]
