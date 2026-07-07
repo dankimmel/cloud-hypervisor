@@ -1077,6 +1077,12 @@ components:
           default: false
         vhost_socket:
           type: string
+        bounce:
+          type: boolean
+          default: false
+        bounce_pool_size:
+          type: integer
+          format: int64
         vhost_mode:
           type: string
           default: "Client"

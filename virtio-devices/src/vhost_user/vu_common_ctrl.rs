@@ -223,8 +223,12 @@ impl VhostUserHandle {
         {
             return Err(Error::VringBasesCountMismatch(bases.len(), queues.len()));
         }
+        // The pool is sized for the transport-maximum queue count; a
+        // device may bounce fewer queues (e.g. net keeps its control
+        // queue VMM-emulated), so only too few fds is an error. The
+        // leading fds pair with the queues here one-to-one.
         if let Some(bounce) = &bounce
-            && bounce.fds.len() != queues.len()
+            && bounce.fds.len() < queues.len()
         {
             return Err(Error::BounceFdsCountMismatch(
                 bounce.fds.len(),

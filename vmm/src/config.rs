@@ -1721,6 +1721,7 @@ impl NetConfig {
     \"tap=<if_name>,ip=<ip_addr>,mask=<net_mask>,mac=<mac_addr>,fd=<[fd1,fd2,...]>,iommu=on|off,\
     num_queues=<number_of_queues>,queue_size=<size_of_each_queue>,id=<device_id>,\
     vhost_user=<vhost_user_enable>,socket=<vhost_user_socket_path>,vhost_mode=client|server,\
+    bounce=on|off,bounce_pool_size=<bytes>,\
     bw_size=<bytes>,bw_one_time_burst=<bytes>,bw_refill_time=<ms>,\
     ops_size=<io_ops>,ops_one_time_burst=<io_ops>,ops_refill_time=<ms>,\
     pci_segment=<segment_id>,pci_device_id=<pci_slot>,\
@@ -1743,6 +1744,8 @@ impl NetConfig {
             .add("num_queues")
             .add("vhost_user")
             .add("socket")
+            .add("bounce")
+            .add("bounce_pool_size")
             .add("vhost_mode")
             .add("fd")
             .add("bw_size")
@@ -1793,6 +1796,15 @@ impl NetConfig {
             .unwrap_or(Toggle(false))
             .0;
         let vhost_socket = parser.get("socket");
+        let bounce = parser
+            .convert::<Toggle>("bounce")
+            .map_err(Error::ParseNetwork)?
+            .unwrap_or(Toggle(false))
+            .0;
+        let bounce_pool_size = parser
+            .convert::<ByteSized>("bounce_pool_size")
+            .map_err(Error::ParseNetwork)?
+            .map(|b| b.0);
         let vhost_mode = parser
             .convert("vhost_mode")
             .map_err(Error::ParseNetwork)?
@@ -1866,6 +1878,8 @@ impl NetConfig {
             queue_size,
             vhost_user,
             vhost_socket,
+            bounce,
+            bounce_pool_size,
             vhost_mode,
             fds,
             rate_limiter_config,
@@ -1907,6 +1921,20 @@ impl NetConfig {
         }
 
         validate_queue_size(self.queue_size)?;
+
+        // Bounce checks precede the generic vhost-user/iommu rejection so
+        // a bounce device produces the clearer bounce-specific error.
+        if self.bounce && !self.vhost_user {
+            return Err(ValidationError::BounceRequiresVhostUser);
+        }
+
+        if self.bounce && self.pci_common.iommu {
+            return Err(ValidationError::BounceIommuNotSupported);
+        }
+
+        if self.bounce_pool_size.is_some() && !self.bounce {
+            return Err(ValidationError::BouncePoolSizeRequiresBounce);
+        }
 
         if self.vhost_user && self.pci_common.iommu {
             return Err(ValidationError::IommuNotSupported);
@@ -4476,6 +4504,8 @@ mod unit_tests {
             queue_size: 256,
             vhost_user: false,
             vhost_socket: None,
+            bounce: false,
+            bounce_pool_size: None,
             vhost_mode: VhostMode::Client,
             fds: None,
             rate_limiter_config: None,
@@ -4483,6 +4513,24 @@ mod unit_tests {
             offload_ufo: true,
             offload_csum: true,
         }
+    }
+
+    #[test]
+    fn test_net_bounce() -> Result<()> {
+        let cfg = NetConfig::parse(
+            "mac=de:ad:be:ef:12:34,vhost_user=on,socket=/s,bounce=on,bounce_pool_size=64M",
+        )?;
+        assert!(cfg.bounce);
+        assert_eq!(cfg.bounce_pool_size, Some(64 << 20));
+
+        let vm_config = valid_vm_config();
+        // bounce requires vhost_user.
+        let bad = NetConfig::parse("mac=de:ad:be:ef:12:34,bounce=on")?;
+        assert!(matches!(
+            bad.validate(&vm_config),
+            Err(ValidationError::BounceRequiresVhostUser)
+        ));
+        Ok(())
     }
 
     #[test]

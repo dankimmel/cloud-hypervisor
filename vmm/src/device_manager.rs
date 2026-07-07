@@ -2942,7 +2942,11 @@ impl DeviceManager {
                 socket,
                 num_queues: net_cfg.num_queues,
                 queue_size: net_cfg.queue_size,
-                bounce: None,
+                bounce: net_cfg
+                    .bounce
+                    .then(|| virtio_devices::vhost_user::bounce::BounceConfig {
+                        pool_size: net_cfg.bounce_pool_size,
+                    }),
             };
             let server = match net_cfg.vhost_mode {
                 VhostMode::Client => false,
