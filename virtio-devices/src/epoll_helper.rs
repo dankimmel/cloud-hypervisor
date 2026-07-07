@@ -66,6 +66,13 @@ pub trait EpollHelperHandler {
         Ok(())
     }
 
+    // Invoked when a pause event is observed, before the thread
+    // acknowledges the pause at the synchronization barrier and parks.
+    // Lets implementations flush pending work so they park in a
+    // consistent state (e.g. the vhost-user bounce worker drains
+    // completed requests back to guest memory). By default, a no-op.
+    fn on_pause(&mut self, _helper: &mut EpollHelper) {}
+
     // In some situations, it might be useful to know the full list of events
     // triggered while waiting on epoll_wait(). And having this list provided
     // prior to the iterations over each event might help make some informed
@@ -218,6 +225,10 @@ impl EpollHelper {
                     EPOLL_HELPER_EVENT_PAUSE => {
                         debug!("PAUSE_EVENT received, pausing epoll loop");
 
+                        // Give the handler a chance to flush pending work
+                        // before the pause is acknowledged.
+                        handler.on_pause(self);
+
                         // Acknowledge the pause is effective by using the
                         // paused_sync barrier.
                         paused_sync.wait();
@@ -318,5 +329,116 @@ impl EpollHelper {
 impl AsRawFd for EpollHelper {
     fn as_raw_fd(&self) -> RawFd {
         self.epoll_file.as_raw_fd()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+    use std::time::Duration;
+
+    use super::*;
+
+    const READY_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 1;
+
+    struct PauseFlagHandler {
+        ready_evt: EventFd,
+        ready: Arc<AtomicBool>,
+        on_pause_ran: Arc<AtomicBool>,
+    }
+
+    impl EpollHelperHandler for PauseFlagHandler {
+        fn handle_event(
+            &mut self,
+            _helper: &mut EpollHelper,
+            event: &epoll::Event,
+        ) -> Result<(), EpollHelperError> {
+            if event.data as u16 == READY_EVENT {
+                // Processing this event proves the worker has reached the
+                // epoll loop, so the pause below cannot race the pre-loop
+                // guard.
+                let _ = self.ready_evt.read();
+                self.ready.store(true, Ordering::SeqCst);
+            }
+            Ok(())
+        }
+
+        fn on_pause(&mut self, _helper: &mut EpollHelper) {
+            self.on_pause_ran.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn on_pause_runs_before_barrier_release() {
+        let kill_evt = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+        let pause_evt = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+        let ready_evt = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+        let paused = Arc::new(AtomicBool::new(false));
+        let paused_sync = Arc::new(Barrier::new(2));
+        let ready = Arc::new(AtomicBool::new(false));
+        let on_pause_ran = Arc::new(AtomicBool::new(false));
+
+        let worker = {
+            let kill_evt = kill_evt.try_clone().unwrap();
+            let pause_evt = pause_evt.try_clone().unwrap();
+            let ready_evt = ready_evt.try_clone().unwrap();
+            let paused = paused.clone();
+            let paused_sync = paused_sync.clone();
+            let ready = ready.clone();
+            let on_pause_ran = on_pause_ran.clone();
+            thread::spawn(move || {
+                let mut helper = EpollHelper::new(&kill_evt, &pause_evt).unwrap();
+                helper
+                    .add_event(ready_evt.as_raw_fd(), READY_EVENT)
+                    .unwrap();
+                let mut handler = PauseFlagHandler {
+                    ready_evt,
+                    ready,
+                    on_pause_ran,
+                };
+                helper.run(&paused, &paused_sync, &mut handler).unwrap();
+            })
+        };
+
+        // Make sure the worker is inside the epoll loop before pausing, so
+        // the pause cannot deadlock against the pre-loop paused guard.
+        ready_evt.write(1).unwrap();
+        while !ready.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        // Pause the worker the way VirtioCommon::pause does.
+        paused.store(true, Ordering::SeqCst);
+        pause_evt.write(1).unwrap();
+        paused_sync.wait();
+        // The barrier released, so the hook must already have run.
+        assert!(on_pause_ran.load(Ordering::SeqCst));
+
+        // Resume and terminate the worker.
+        paused.store(false, Ordering::SeqCst);
+        worker.thread().unpark();
+        kill_evt.write(1).unwrap();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn default_on_pause_is_noop() {
+        struct Bare;
+        impl EpollHelperHandler for Bare {
+            fn handle_event(
+                &mut self,
+                _helper: &mut EpollHelper,
+                _event: &epoll::Event,
+            ) -> Result<(), EpollHelperError> {
+                Ok(())
+            }
+        }
+        // The default implementation compiles and does nothing.
+        let kill_evt = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+        let pause_evt = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+        let mut helper = EpollHelper::new(&kill_evt, &pause_evt).unwrap();
+        Bare.on_pause(&mut helper);
     }
 }
