@@ -14,9 +14,11 @@
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Barrier, Mutex};
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
-use vm_memory::GuestMemoryAtomic;
+use log::error;
+use vm_memory::{GuestAddressSpace, GuestMemoryAtomic};
 use vmm_sys_util::eventfd::EventFd;
 
 use super::BounceQueueFds;
@@ -24,7 +26,7 @@ use super::pool::BouncePool;
 use super::shadow_queue::ShadowQueue;
 use crate::{
     EPOLL_HELPER_EVENT_LAST, EpollHelper, EpollHelperError, EpollHelperHandler, GuestMemoryMmap,
-    VirtioInterrupt,
+    VirtioInterrupt, VirtioInterruptType,
 };
 
 /// Maximum time the worker waits for the backend to drain outstanding
@@ -92,20 +94,56 @@ impl BounceEpollHandler {
     /// Mirror every queue's currently-available chains once, kicking the
     /// backend where progress was made.
     fn initial_sweep(&mut self) {
-        todo!("implemented in docs/vhost-user-bounce-plan.md commit 13")
+        for i in 0..self.queues.len() {
+            self.mirror_and_kick(i);
+        }
     }
 
     /// Handle a guest kick on queue `i`: drain the eventfd, mirror new
     /// chains, and kick the backend if any were published.
-    fn on_guest_kick(&mut self, _i: usize) {
-        todo!("implemented in docs/vhost-user-bounce-plan.md commit 13")
+    fn on_guest_kick(&mut self, i: usize) {
+        let _ = self.queues[i].2.read();
+        self.mirror_and_kick(i);
     }
 
     /// Handle a backend call on queue `i`: drain the eventfd, copy
-    /// completions back to the guest and interrupt it, then retry any
-    /// stalled queue now that pool space may have been freed.
-    fn on_backend_call(&mut self, _i: usize) {
-        todo!("implemented in docs/vhost-user-bounce-plan.md commit 13")
+    /// completions back to the guest and interrupt it, then retry every
+    /// queue now that pool space may have been freed (mirroring an idle
+    /// queue is cheap and only kicks the backend if it publishes work).
+    fn on_backend_call(&mut self, i: usize) {
+        let _ = self.fds[i].shadow_call.read();
+        self.complete_and_interrupt(i);
+        for q in 0..self.queues.len() {
+            self.mirror_and_kick(q);
+        }
+    }
+
+    /// Mirror newly available chains of queue `i` into the shadow ring
+    /// and kick the backend if anything was published.
+    fn mirror_and_kick(&mut self, i: usize) {
+        let mem = self.guest_mem.memory();
+        let mut guard = self.shared.lock().unwrap();
+        let BounceShared { pool, shadow } = &mut *guard;
+        let outcome = shadow[i].mirror_avail(&mem, &mut self.queues[i].1, pool);
+        drop(guard);
+        if outcome.chains > 0 {
+            let _ = self.fds[i].shadow_kick.write(1);
+        }
+    }
+
+    /// Copy queue `i`'s completions back to guest memory and interrupt
+    /// the guest if it wants one. Returns the number of chains completed.
+    fn complete_and_interrupt(&mut self, i: usize) -> usize {
+        let mem = self.guest_mem.memory();
+        let mut guard = self.shared.lock().unwrap();
+        let BounceShared { pool, shadow } = &mut *guard;
+        let outcome = shadow[i].complete_used(&mem, &mut self.queues[i].1, pool);
+        drop(guard);
+        if outcome.needs_interrupt {
+            let qidx = self.queues[i].0 as u16;
+            let _ = self.interrupt.trigger(VirtioInterruptType::Queue(qidx));
+        }
+        outcome.chains
     }
 }
 
@@ -129,7 +167,32 @@ impl EpollHelperHandler for BounceEpollHandler {
     }
 
     fn on_pause(&mut self, _helper: &mut EpollHelper) {
-        todo!("implemented in docs/vhost-user-bounce-plan.md commit 13")
+        // Drain outstanding completions back to guest memory so the
+        // device parks consistent. The backend's vrings were already
+        // disabled by VhostUserCommon::pause, so the in-flight set only
+        // shrinks from here.
+        let deadline = Instant::now() + self.drain_timeout;
+        loop {
+            for i in 0..self.queues.len() {
+                let _ = self.fds[i].shadow_call.read();
+                self.complete_and_interrupt(i);
+            }
+            let inflight: usize = {
+                let guard = self.shared.lock().unwrap();
+                guard.shadow.iter().map(|s| s.inflight_count()).sum()
+            };
+            if inflight == 0 {
+                break;
+            }
+            if Instant::now() >= deadline {
+                error!(
+                    "vhost-user bounce pause drain timed out with {inflight} request(s) \
+                     still in flight; a snapshot taken now will be rejected"
+                );
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
     }
 }
 
@@ -262,7 +325,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 13"]
     fn guest_kick_mirrors_and_kicks_daemon() {
         let mut h = build(1, 8, 8192);
         h.start();
@@ -283,7 +345,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 13"]
     fn daemon_call_copies_back_and_interrupts() {
         let mut h = build(1, 8, 8192);
         h.start();
@@ -306,7 +367,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 13"]
     fn end_to_end_echo_roundtrip() {
         let mut h = build(1, 8, 8192);
         h.start();
@@ -338,7 +398,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 13"]
     fn completion_retries_stalled_queue_across_queue_boundary() {
         // Queue 0 fills the arena, queue 1 stalls; completing queue 0
         // must let the worker mirror queue 1 without a fresh guest kick.
@@ -371,7 +430,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 13"]
     fn pause_drains_pending_completions_before_barrier() {
         let mut h = build(1, 8, 8192);
         h.start();
@@ -399,7 +457,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 13"]
     fn kill_event_terminates_worker_promptly() {
         let mut h = build(1, 8, 8192);
         h.start();
@@ -408,7 +465,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 13"]
     fn worker_initial_sweep_mirrors_preexisting_avail_entries() {
         // Publish before the worker starts and never kick: the startup
         // sweep must still mirror the entry.
@@ -422,7 +478,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 13"]
     fn two_queues_route_events_independently() {
         let mut h = build(2, 8, 8192);
         h.start();
