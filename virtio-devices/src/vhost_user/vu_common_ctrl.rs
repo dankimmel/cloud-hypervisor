@@ -30,6 +30,7 @@ use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::timerfd::TimerFd;
 
 use super::bounce::pool::{SealedMemfdError, create_sealed_memfd};
+use super::bounce::{BouncePool, BounceQueueFds};
 use super::{Error, Result, VhostUserState};
 use crate::vhost_user::Inflight;
 use crate::{
@@ -39,6 +40,38 @@ use crate::{
 
 // Size of a dirty page for vhost-user.
 const VHOST_LOG_PAGE: u64 = 0x1000;
+
+/// Everything `setup_vhost_user` needs to wire a device in bounce mode:
+/// the backend then sees the pool as its whole guest, with shadow rings
+/// inside it and VMM-owned eventfds instead of the guest's.
+pub struct BounceSetup<'a> {
+    pub pool: &'a BouncePool,
+    pub fds: &'a [BounceQueueFds],
+}
+
+/// The memory table sent to a bounce-mode backend: exactly one region,
+/// the pool, presented as the whole guest at GPA 0.
+// TODO: expect(dead_code) is removed when the next commit wires the
+// helper into setup_vhost_user (docs/vhost-user-bounce-plan.md commit 10).
+#[cfg_attr(not(test), expect(dead_code))]
+pub(crate) fn bounce_mem_region(_pool: &BouncePool) -> VhostUserMemoryRegionInfo {
+    todo!("implemented in docs/vhost-user-bounce-plan.md commit 10")
+}
+
+/// The vring addresses sent to a bounce-mode backend: host addresses of
+/// the shadow rings inside the pool mapping. `queue_size` is the actual
+/// negotiated size, `max_size` the transport maximum.
+// TODO: expect(dead_code) is removed when the next commit wires the
+// helper into setup_vhost_user (docs/vhost-user-bounce-plan.md commit 10).
+#[cfg_attr(not(test), expect(dead_code))]
+pub(crate) fn bounce_vring_config(
+    _pool: &BouncePool,
+    _queue_index: usize,
+    _queue_size: u16,
+    _max_size: u16,
+) -> VringConfigData {
+    todo!("implemented in docs/vhost-user-bounce-plan.md commit 10")
+}
 
 #[derive(Debug, Clone)]
 pub struct VhostUserConfig {
@@ -738,5 +771,63 @@ impl VhostUserHandle {
         } else {
             Err(Error::MissingShmLogRegion)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::bounce::PoolLayout;
+    use super::super::bounce::pool::{avail_ring_size, desc_table_size};
+    use super::*;
+
+    fn pool(num_queues: usize, queue_size: u16) -> BouncePool {
+        BouncePool::new(&PoolLayout {
+            num_queues,
+            queue_size,
+            buffer_capacity: 4096,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 10"]
+    fn bounce_mem_region_is_pool_at_gpa_zero() {
+        let pool = pool(2, 128);
+        let region = bounce_mem_region(&pool);
+        assert_eq!(region.guest_phys_addr, 0);
+        assert_eq!(region.memory_size, pool.size());
+        assert_eq!(region.userspace_addr, pool.host_base());
+        assert_eq!(region.mmap_offset, 0);
+        assert_eq!(region.mmap_handle, pool.memfd());
+    }
+
+    #[test]
+    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 10"]
+    fn bounce_vring_config_points_into_pool_rings() {
+        let pool = pool(2, 256);
+        let config = bounce_vring_config(&pool, 1, 256, 256);
+        let offs = pool.ring_offsets(1);
+        assert_eq!(config.desc_table_addr, pool.host_base() + offs.desc);
+        assert_eq!(config.avail_ring_addr, pool.host_base() + offs.avail);
+        assert_eq!(config.used_ring_addr, pool.host_base() + offs.used);
+        assert_eq!(config.queue_size, 256);
+        assert_eq!(config.queue_max_size, 256);
+        assert_eq!(config.flags, 0);
+        assert!(config.log_addr.is_none());
+    }
+
+    #[test]
+    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 10"]
+    fn bounce_vring_config_uses_actual_size_smaller_than_max() {
+        let pool = pool(1, 256);
+        let config = bounce_vring_config(&pool, 0, 64, 256);
+        assert_eq!(config.queue_size, 64);
+        assert_eq!(config.queue_max_size, 256);
+        // The rings still live at the offsets laid out for the maximum
+        // size; a smaller actual size uses their leading part.
+        let offs = pool.ring_offsets(0);
+        assert!(config.avail_ring_addr - config.desc_table_addr >= desc_table_size(64));
+        assert!(config.used_ring_addr - config.avail_ring_addr >= avail_ring_size(64));
+        assert_eq!(config.desc_table_addr, pool.host_base() + offs.desc);
     }
 }

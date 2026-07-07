@@ -26,10 +26,32 @@ pub use shadow_queue::{CompleteOutcome, MirrorOutcome, ShadowQueue, ShadowQueueC
 use thiserror::Error;
 use vm_memory::mmap::MmapRegionError;
 use vm_memory::{GuestMemoryError, GuestRegionCollectionError};
+use vmm_sys_util::eventfd::EventFd;
+
+/// The eventfds wiring one shadow queue to the backend: the VMM kicks
+/// `shadow_kick` after publishing shadow avail entries, and the backend
+/// signals `shadow_call` after publishing shadow used entries. These are
+/// what the backend receives via SET_VRING_KICK/SET_VRING_CALL instead
+/// of the guest's ioeventfd and irqfd.
+pub struct BounceQueueFds {
+    pub shadow_kick: EventFd,
+    pub shadow_call: EventFd,
+}
+
+impl BounceQueueFds {
+    pub fn new() -> Result<Self, BounceError> {
+        Ok(BounceQueueFds {
+            shadow_kick: EventFd::new(libc::EFD_NONBLOCK).map_err(BounceError::CreateEventFd)?,
+            shadow_call: EventFd::new(libc::EFD_NONBLOCK).map_err(BounceError::CreateEventFd)?,
+        })
+    }
+}
 
 /// Errors from the bounce buffer pool machinery.
 #[derive(Error, Debug)]
 pub enum BounceError {
+    #[error("Failed creating bounce eventfd")]
+    CreateEventFd(#[source] io::Error),
     #[error("Invalid free of pool extent at offset {offset} len {len}")]
     InvalidFree { offset: u64, len: u64 },
     #[error("Failed creating bounce pool memfd")]
@@ -44,4 +66,21 @@ pub enum BounceError {
     PoolGuestMemory(#[source] GuestRegionCollectionError),
     #[error("Bounce pool memory access failed")]
     PoolMemory(#[source] GuestMemoryError),
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::io::AsRawFd;
+
+    use super::*;
+
+    #[test]
+    fn bounce_queue_fds_are_distinct_eventfds() {
+        let fds = BounceQueueFds::new().unwrap();
+        assert_ne!(fds.shadow_kick.as_raw_fd(), fds.shadow_call.as_raw_fd());
+        fds.shadow_kick.write(1).unwrap();
+        assert_eq!(fds.shadow_kick.read().unwrap(), 1);
+        fds.shadow_call.write(3).unwrap();
+        assert_eq!(fds.shadow_call.read().unwrap(), 3);
+    }
 }
