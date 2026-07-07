@@ -17,6 +17,7 @@ pub mod pool;
 pub mod shadow_queue;
 #[cfg(test)]
 pub(crate) mod test_utils;
+pub mod worker;
 
 use std::io;
 

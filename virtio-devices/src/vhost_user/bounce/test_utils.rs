@@ -5,14 +5,19 @@
 //! builder (acting as the driver) and a fake vhost-user backend that
 //! operates on a [`BouncePool`]'s shadow rings (acting as the daemon).
 
+use std::io;
+use std::os::unix::io::{AsRawFd, RawFd};
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 
 use virtio_queue::desc::split::Descriptor;
 use virtio_queue::{Queue, QueueT};
 use vm_memory::{Bytes, GuestAddress};
+use vmm_sys_util::eventfd::EventFd;
 
 use super::pool::BouncePool;
-use crate::GuestMemoryMmap;
+use crate::{GuestMemoryMmap, VirtioInterrupt, VirtioInterruptType};
 
 pub(crate) const GUEST_MEM_SIZE: usize = 0x100_000;
 
@@ -283,4 +288,83 @@ impl FakeDaemon {
         self.complete(pool, q, head, written);
         head
     }
+}
+
+/// A `VirtioInterrupt` for worker tests: records which queues were
+/// triggered and signals a per-queue eventfd so a test can wait for an
+/// interrupt with a bounded timeout.
+pub(crate) struct TestInterrupt {
+    evts: Vec<EventFd>,
+}
+
+impl TestInterrupt {
+    pub(crate) fn new(num_queues: usize) -> Arc<Self> {
+        Arc::new(TestInterrupt {
+            evts: (0..num_queues)
+                .map(|_| EventFd::new(libc::EFD_NONBLOCK).unwrap())
+                .collect(),
+        })
+    }
+
+    /// Wait up to `timeout` for queue `q` to be interrupted at least once.
+    pub(crate) fn wait_interrupt(&self, q: usize, timeout: Duration) -> bool {
+        wait_readable(self.evts[q].as_raw_fd(), timeout)
+    }
+}
+
+impl VirtioInterrupt for TestInterrupt {
+    fn trigger(&self, int_type: VirtioInterruptType) -> io::Result<()> {
+        if let VirtioInterruptType::Queue(q) = int_type {
+            self.evts[q as usize].write(1)?;
+        }
+        Ok(())
+    }
+
+    fn set_notifier(
+        &self,
+        _int_type: u32,
+        _notifier: Option<EventFd>,
+        _vm: &dyn hypervisor::Vm,
+    ) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Poll `fd` for readability up to `timeout`; true if it became readable.
+pub(crate) fn wait_readable(fd: RawFd, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        let ms = remaining.as_millis().min(i32::MAX as u128) as i32;
+        // SAFETY: FFI call with a valid single-element pollfd.
+        let ret = unsafe { libc::poll(&mut pfd, 1, ms) };
+        if ret > 0 {
+            return true;
+        }
+        if ret == 0 {
+            return false;
+        }
+        // EINTR: retry until the deadline.
+    }
+}
+
+/// Write `len` copies of `byte` into guest memory at `addr`.
+pub(crate) fn fill_guest(mem: &GuestMemoryMmap, addr: u64, len: u32, byte: u8) {
+    mem.write_slice(&vec![byte; len as usize], GuestAddress(addr))
+        .unwrap();
+}
+
+/// Read `len` bytes from guest memory at `addr`.
+pub(crate) fn read_guest(mem: &GuestMemoryMmap, addr: u64, len: u32) -> Vec<u8> {
+    let mut buf = vec![0u8; len as usize];
+    mem.read_slice(&mut buf, GuestAddress(addr)).unwrap();
+    buf
 }
