@@ -19,12 +19,22 @@
 //!   guest descriptor-table rewrites).
 
 use std::num::Wrapping;
+use std::sync::atomic::Ordering;
 
-use virtio_queue::Queue;
-use vm_memory::GuestAddress;
+use log::error;
+use virtio_bindings::virtio_ring::{VRING_DESC_F_INDIRECT, VRING_DESC_F_NEXT, VRING_DESC_F_WRITE};
+use virtio_queue::desc::split::Descriptor;
+use virtio_queue::{Queue, QueueOwnedT, QueueT};
+use vm_memory::{Address, Bytes, GuestAddress, GuestMemory, GuestMemoryError};
 
+use super::allocator::BOUNCE_ALLOC_ALIGN;
 use super::pool::{BouncePool, RingOffsets};
 use crate::GuestMemoryMmap;
+
+/// Chunk size for staged guest<->pool copies. Staging through a scratch
+/// buffer keeps every access inside the safe vm-memory slice APIs while
+/// still handling guest buffers that span region boundaries.
+const COPY_CHUNK: usize = 16 * 1024;
 
 /// Static configuration of one shadow queue.
 #[derive(Clone, Copy)]
@@ -79,9 +89,6 @@ struct InflightChain {
 }
 
 /// Mirrors one guest virtqueue into a shadow ring inside the pool.
-// TODO: expect(dead_code) is removed as plan commits 6-8 implement
-// mirror_avail/complete_used (docs/vhost-user-bounce-plan.md).
-#[expect(dead_code)]
 pub struct ShadowQueue {
     queue_index: usize,
     size: u16,
@@ -143,11 +150,261 @@ impl ShadowQueue {
     /// descriptor chains.
     pub fn mirror_avail(
         &mut self,
-        _guest_mem: &GuestMemoryMmap,
-        _guest_q: &mut Queue,
-        _pool: &mut BouncePool,
+        guest_mem: &GuestMemoryMmap,
+        guest_q: &mut Queue,
+        pool: &mut BouncePool,
     ) -> MirrorOutcome {
-        todo!("implemented in docs/vhost-user-bounce-plan.md commit 6")
+        let mut out = MirrorOutcome::default();
+        if self.broken {
+            return out;
+        }
+
+        'chains: while let Some(chain) = guest_q.pop_descriptor_chain(guest_mem) {
+            let guest_head = chain.head_index();
+
+            // Detect indirect chains before walking them: virtio-queue's
+            // iterator transparently resolves indirect tables, which the
+            // bounce path does not support (yet).
+            match self.head_flags(guest_mem, guest_q.desc_table(), guest_head) {
+                Ok(flags) if flags & VRING_DESC_F_INDIRECT as u16 != 0 => {
+                    self.mark_broken("chain uses indirect descriptors, unsupported with bounce");
+                    break 'chains;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    self.mark_broken(&format!("descriptor table inaccessible: {e}"));
+                    break 'chains;
+                }
+            }
+
+            // Walk the chain. The iterator stops silently on loops,
+            // overlong chains and unreadable descriptor tables; in all
+            // those cases the last yielded descriptor still claims a
+            // successor, which is how they are told apart from a clean
+            // end of chain.
+            let mut descs: Vec<Descriptor> = Vec::new();
+            let mut open_ended = false;
+            for desc in chain {
+                open_ended = desc.has_next();
+                descs.push(desc);
+            }
+            if descs.is_empty() || open_ended {
+                self.mark_broken("malformed descriptor chain");
+                break 'chains;
+            }
+            for desc in &descs {
+                if desc.len() != 0 && !guest_mem.check_range(desc.addr(), desc.len() as usize) {
+                    self.mark_broken("descriptor buffer outside guest memory");
+                    break 'chains;
+                }
+            }
+
+            let needed: u64 = descs
+                .iter()
+                .filter(|d| d.len() != 0)
+                .map(|d| u64::from(d.len()).next_multiple_of(BOUNCE_ALLOC_ALIGN))
+                .sum();
+
+            // Reserve shadow descriptor slots and pool extents,
+            // all-or-nothing: on failure roll everything back, rewind the
+            // guest queue cursor and stall until completions free space.
+            if self.free_slots.len() < descs.len() {
+                guest_q.go_to_previous_position();
+                self.enter_stall(needed, pool.buffer_capacity());
+                out.stalled = true;
+                break 'chains;
+            }
+            let mut extents: Vec<GuestAddress> = Vec::with_capacity(descs.len());
+            for desc in &descs {
+                let extent = if desc.len() == 0 {
+                    Some(GuestAddress(0))
+                } else {
+                    pool.alloc(u64::from(desc.len()))
+                };
+                match extent {
+                    Some(addr) => extents.push(addr),
+                    None => {
+                        self.rollback_extents(pool, &descs, &extents);
+                        guest_q.go_to_previous_position();
+                        self.enter_stall(needed, pool.buffer_capacity());
+                        out.stalled = true;
+                        break 'chains;
+                    }
+                }
+            }
+
+            // Copy device-readable data into the pool.
+            for (desc, extent) in descs.iter().zip(&extents) {
+                if desc.len() == 0 || desc.is_write_only() {
+                    continue;
+                }
+                if let Err(e) = self.copy_chunked(
+                    |buf, offset| guest_mem.read_slice(buf, desc.addr().unchecked_add(offset)),
+                    |buf, offset| pool.mem().write_slice(buf, extent.unchecked_add(offset)),
+                    desc.len(),
+                ) {
+                    self.rollback_extents(pool, &descs, &extents);
+                    self.mark_broken(&format!("guest buffer copy failed: {e}"));
+                    break 'chains;
+                }
+            }
+
+            // Write the rewritten chain into the shadow descriptor table.
+            let count = descs.len();
+            let mut slots = Vec::with_capacity(count);
+            for _ in 0..count {
+                // Availability was checked above.
+                slots.push(self.free_slots.pop().unwrap());
+            }
+            for (i, (desc, extent)) in descs.iter().zip(&extents).enumerate() {
+                let mut flags = 0u16;
+                if desc.is_write_only() {
+                    flags |= VRING_DESC_F_WRITE as u16;
+                }
+                let next = if i + 1 < count {
+                    flags |= VRING_DESC_F_NEXT as u16;
+                    slots[i + 1]
+                } else {
+                    0
+                };
+                let shadow = Descriptor::new(extent.raw_value(), desc.len(), flags, next);
+                let addr = GuestAddress(self.ring.desc + u64::from(slots[i]) * 16);
+                // Writes into the pool cannot fail (fixed, mapped, in
+                // bounds); treat failure as an internal error.
+                if pool.mem().write_obj(shadow, addr).is_err() {
+                    self.mark_broken("shadow descriptor write failed");
+                    break 'chains;
+                }
+            }
+
+            // Publish the avail entry (the index store below makes the
+            // whole batch visible to the backend).
+            let pos = self.shadow_avail_idx.0 % self.size;
+            let entry_addr = GuestAddress(self.ring.avail + 4 + u64::from(pos) * 2);
+            if pool.mem().write_obj(slots[0], entry_addr).is_err() {
+                self.mark_broken("shadow avail entry write failed");
+                break 'chains;
+            }
+            self.shadow_avail_idx += 1;
+
+            let segments = descs
+                .iter()
+                .zip(&extents)
+                .map(|(d, a)| Segment {
+                    guest_addr: d.addr(),
+                    pool_addr: *a,
+                    len: d.len(),
+                    writable: d.is_write_only(),
+                })
+                .collect();
+            let head_slot = usize::from(slots[0]);
+            debug_assert!(self.inflight[head_slot].is_none());
+            self.inflight[head_slot] = Some(InflightChain {
+                guest_head,
+                segments,
+                slots,
+            });
+            self.inflight_count += 1;
+
+            out.chains += 1;
+            self.stalled = false;
+            self.stall_logged = false;
+        }
+
+        if out.chains > 0 {
+            // Release-store the new shadow avail index: everything written
+            // above becomes visible to the backend no later than this.
+            let idx_addr = GuestAddress(self.ring.avail + 2);
+            if pool
+                .mem()
+                .store(self.shadow_avail_idx.0, idx_addr, Ordering::Release)
+                .is_err()
+            {
+                self.mark_broken("shadow avail index store failed");
+            }
+        }
+        out
+    }
+
+    /// Read the raw flags of the descriptor at `head` in the guest
+    /// descriptor table (before any chain walking).
+    fn head_flags(
+        &self,
+        guest_mem: &GuestMemoryMmap,
+        desc_table: u64,
+        head: u16,
+    ) -> Result<u16, GuestMemoryError> {
+        // flags is the u16 at offset 12 of the 16-byte descriptor.
+        guest_mem.load(
+            GuestAddress(desc_table + u64::from(head) * 16 + 12),
+            Ordering::Relaxed,
+        )
+    }
+
+    /// Free the extents allocated so far for a chain that will not be
+    /// published. `extents` parallels the leading elements of `descs`.
+    fn rollback_extents(
+        &mut self,
+        pool: &mut BouncePool,
+        descs: &[Descriptor],
+        extents: &[GuestAddress],
+    ) {
+        for (desc, extent) in descs.iter().zip(extents) {
+            if desc.len() != 0 {
+                // Freeing a just-allocated extent cannot fail.
+                let res = pool.free(*extent, u64::from(desc.len()));
+                debug_assert!(res.is_ok());
+            }
+        }
+    }
+
+    /// Staged copy of `len` bytes through the scratch buffer; `read` and
+    /// `write` receive (chunk, offset) pairs.
+    fn copy_chunked(
+        &mut self,
+        mut read: impl FnMut(&mut [u8], u64) -> Result<(), GuestMemoryError>,
+        mut write: impl FnMut(&[u8], u64) -> Result<(), GuestMemoryError>,
+        len: u32,
+    ) -> Result<(), GuestMemoryError> {
+        if self.scratch.is_empty() {
+            self.scratch.resize(COPY_CHUNK, 0);
+        }
+        let len = u64::from(len);
+        let mut done = 0u64;
+        while done < len {
+            let chunk = (len - done).min(COPY_CHUNK as u64) as usize;
+            read(&mut self.scratch[..chunk], done)?;
+            write(&self.scratch[..chunk], done)?;
+            done += chunk as u64;
+        }
+        Ok(())
+    }
+
+    /// Enter (or stay in) a stall. Permanently unsatisfiable chains are
+    /// reported once per episode.
+    fn enter_stall(&mut self, needed: u64, capacity: u64) {
+        self.stalled = true;
+        if needed > capacity && !self.stall_logged {
+            error!(
+                "vhost-user bounce queue {}: descriptor chain needs {needed} arena bytes \
+                 but the pool arena is only {capacity} bytes; the queue will stall until \
+                 device reset (increase bounce_pool_size)",
+                self.queue_index
+            );
+            self.stall_logged = true;
+        }
+    }
+
+    /// Record a fatal guest protocol violation; the queue stops
+    /// processing in both directions until device reset.
+    fn mark_broken(&mut self, reason: &str) {
+        if !self.broken {
+            error!(
+                "vhost-user bounce queue {}: {reason}; queue disabled until device reset",
+                self.queue_index
+            );
+            self.broken = true;
+        }
     }
 
     /// Consume new shadow used entries: copy device-written data back to
@@ -257,7 +514,6 @@ mod tests {
     // ---- Mirroring (unignored in plan commit 6) ----
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 6"]
     fn mirror_single_readable_descriptor_copies_data_and_publishes() {
         let mut h = harness(8, 8192);
         let buf = h.ring.alloc_buf(512);
@@ -289,7 +545,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 6"]
     fn mirror_writable_descriptor_allocates_but_does_not_copy() {
         let mut h = harness(8, 8192);
         let buf = h.ring.alloc_buf(256);
@@ -309,7 +564,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 6"]
     fn mirror_chain_preserves_order_flags_and_linkage() {
         let mut h = harness(8, 8192);
         let (a, b, c) = (
@@ -339,7 +593,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 6"]
     fn mirror_multiple_chains_in_one_call() {
         let mut h = harness(8, 8192);
         for _ in 0..3 {
@@ -362,7 +615,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 6"]
     fn mirror_idle_when_no_new_entries() {
         let mut h = harness(8, 8192);
         let buf = h.ring.alloc_buf(64);
@@ -379,7 +631,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 6"]
     fn mirror_zero_length_descriptor() {
         let mut h = harness(8, 8192);
         let (a, b) = (h.ring.alloc_buf(64), h.ring.alloc_buf(64));
@@ -395,7 +646,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 6"]
     fn mirror_does_not_forward_guest_no_interrupt_flag() {
         let mut h = harness(8, 8192);
         h.ring
@@ -408,7 +658,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 6"]
     fn mirror_uses_shadow_allocated_slots() {
         let mut h = harness(8, 8192);
         // Burn guest descriptor slots 0..5 on unpublished chains so the
@@ -427,7 +676,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 6"]
     fn mirror_indirect_flag_marks_queue_broken() {
         let mut h = harness(8, 8192);
         let table = h.ring.alloc_buf(64);
@@ -450,7 +698,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 6"]
     fn mirror_chain_longer_than_queue_marks_queue_broken() {
         let mut h = harness(4, 8192);
         let buf = h.ring.alloc_buf(64);
@@ -471,7 +718,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 6"]
     fn mirror_desc_addr_outside_guest_memory_marks_queue_broken() {
         let mut h = harness(8, 8192);
         let head = h.ring.chain(&h.mem, &[(0xdead_0000_0000, 64, false)]);
@@ -484,7 +730,6 @@ mod tests {
     // ---- Backpressure (unignored in plan commit 6) ----
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 6"]
     fn mirror_stalls_when_arena_exhausted_and_rolls_back() {
         let mut h = harness(8, 256);
         let a = h.ring.alloc_buf(192);
@@ -517,7 +762,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 6"]
     fn mirror_stall_is_all_or_nothing_across_chains() {
         let mut h = harness(8, 256);
         let a = h.ring.alloc_buf(128);
@@ -540,7 +784,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 6"]
     fn mirror_oversized_chain_sets_permanent_stall_and_logs_once() {
         let mut h = harness(8, 256);
         let a = h.ring.alloc_buf(512);
@@ -567,14 +810,18 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 6"]
     fn mirror_slot_exhaustion_stalls() {
-        let mut h = harness(2, 1 << 20);
+        // A compliant guest cannot exhaust shadow slots (shadow slot
+        // consumption equals guest descriptor consumption and the
+        // capacities match), but a guest publishing the same chain head
+        // several times can: each duplicate gets its own shadow slots.
+        let mut h = harness(4, 1 << 20);
+        let (a, b) = (h.ring.alloc_buf(64), h.ring.alloc_buf(64));
+        let head = h.ring.chain(&h.mem, &[(a, 64, false), (b, 64, false)]);
         for _ in 0..3 {
-            let buf = h.ring.alloc_buf(64);
-            let head = h.ring.chain(&h.mem, &[(buf, 64, false)]);
             h.ring.publish(&h.mem, head);
         }
+        // Two duplicates consume all four shadow slots; the third stalls.
         let out = mirror(&mut h);
         assert_eq!(
             out,
