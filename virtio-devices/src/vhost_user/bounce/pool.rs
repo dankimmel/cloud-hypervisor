@@ -10,14 +10,15 @@
 //! used ring) per device queue, followed by a buffer arena managed by
 //! [`BounceAllocator`].
 
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::fs::File;
+use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::{ffi, io};
 
-use vm_memory::{GuestAddress, GuestMemory, GuestMemoryRegion};
+use vm_memory::{Address, Bytes, FileOffset, GuestAddress, GuestMemory, GuestMemoryRegion};
 
 use super::BounceError;
-use super::allocator::BounceAllocator;
-use crate::GuestMemoryMmap;
+use super::allocator::{BOUNCE_ALLOC_ALIGN, BounceAllocator};
+use crate::{GuestMemoryMmap, GuestRegionMmap, MmapRegion};
 
 /// Page size used for pool internal alignment. vhost-user assumes 4kiB
 /// pages (see `VHOST_LOG_PAGE`), independent of the host page size.
@@ -78,11 +79,54 @@ pub struct BouncePool {
     allocator: BounceAllocator,
 }
 
+fn align_up(value: u64, align: u64) -> u64 {
+    value.next_multiple_of(align)
+}
+
 impl BouncePool {
     /// Create a pool: memfd (sealed against resizing), one mapping,
     /// zeroed contents, rings laid out per `layout`.
-    pub fn new(_layout: &PoolLayout) -> Result<Self, BounceError> {
-        todo!("implemented in docs/vhost-user-bounce-plan.md commit 4")
+    pub fn new(layout: &PoolLayout) -> Result<Self, BounceError> {
+        let qs = layout.queue_size;
+        let mut ring_offsets = Vec::with_capacity(layout.num_queues);
+        let mut cursor = 0u64;
+        for _ in 0..layout.num_queues {
+            let desc = align_up(cursor, POOL_PAGE_SIZE);
+            let avail = desc + desc_table_size(qs);
+            let used = align_up(avail + avail_ring_size(qs), 4);
+            ring_offsets.push(RingOffsets { desc, avail, used });
+            cursor = used + used_ring_size(qs);
+        }
+        let arena_base = align_up(cursor, POOL_PAGE_SIZE);
+        let size = align_up(arena_base + layout.buffer_capacity, POOL_PAGE_SIZE);
+
+        let name = ffi::CString::new("cloud_hypervisor_bounce_pool").unwrap();
+        let file = create_sealed_memfd(&name, size).map_err(|e| match e {
+            SealedMemfdError::Create(e) => BounceError::MemfdCreate(e),
+            SealedMemfdError::SetSize(e) => BounceError::SetFileSize(e),
+            SealedMemfdError::Seal(e) => BounceError::SetSeals(e),
+        })?;
+
+        let mapping = MmapRegion::build(
+            Some(FileOffset::new(file, 0)),
+            size as usize,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+        )
+        .map_err(BounceError::NewMmapRegion)?;
+        // A region based at GPA 0 cannot overflow the address space
+        // check performed by GuestRegionMmap::new, hence the unwrap.
+        let region = GuestRegionMmap::new(mapping, GuestAddress(0)).unwrap();
+        let mem =
+            GuestMemoryMmap::from_regions(vec![region]).map_err(BounceError::PoolGuestMemory)?;
+
+        Ok(BouncePool {
+            mem,
+            ring_offsets,
+            arena_base,
+            size,
+            allocator: BounceAllocator::new(layout.buffer_capacity),
+        })
     }
 
     /// The pool as guest memory (single region at GPA 0). This is what
@@ -137,36 +181,91 @@ impl BouncePool {
     }
 
     /// Allocate `len` arena bytes; returns the extent's pool GPA.
-    pub fn alloc(&mut self, _len: u64) -> Option<GuestAddress> {
-        todo!("implemented in docs/vhost-user-bounce-plan.md commit 4")
+    pub fn alloc(&mut self, len: u64) -> Option<GuestAddress> {
+        self.allocator
+            .alloc(len)
+            .map(|offset| GuestAddress(self.arena_base + offset))
     }
 
     /// Free (and zero) the extent previously returned by [`Self::alloc`]
     /// for the same (address, requested len) pair.
-    pub fn free(&mut self, _addr: GuestAddress, _len: u64) -> Result<(), BounceError> {
-        todo!("implemented in docs/vhost-user-bounce-plan.md commit 4")
+    pub fn free(&mut self, addr: GuestAddress, len: u64) -> Result<(), BounceError> {
+        let offset =
+            addr.raw_value()
+                .checked_sub(self.arena_base)
+                .ok_or(BounceError::InvalidFree {
+                    offset: addr.raw_value(),
+                    len,
+                })?;
+        self.allocator.free(offset, len)?;
+        // Scrub the full rounded extent so the backend can never observe
+        // stale data from a previous request, including alignment padding.
+        self.zero_range(addr.raw_value(), len.next_multiple_of(BOUNCE_ALLOC_ALIGN))
     }
 
     /// Zero the shadow ring area (not the arena), e.g. before
     /// (re-)initializing a backend session.
     pub fn zero_rings(&mut self) -> Result<(), BounceError> {
-        todo!("implemented in docs/vhost-user-bounce-plan.md commit 4")
+        self.zero_range(0, self.arena_base)
+    }
+
+    fn zero_range(&self, offset: u64, len: u64) -> Result<(), BounceError> {
+        static ZEROES: [u8; 4096] = [0u8; 4096];
+        let mut written = 0u64;
+        while written < len {
+            let chunk = (len - written).min(ZEROES.len() as u64) as usize;
+            self.mem
+                .write_slice(&ZEROES[..chunk], GuestAddress(offset + written))
+                .map_err(BounceError::PoolMemory)?;
+            written += chunk as u64;
+        }
+        Ok(())
     }
 }
 
-/// Thin wrapper around the `memfd_create` syscall.
-///
-/// Moved verbatim from `vu_common_ctrl.rs` (where it backs the dirty-log
-/// shm region) so the bounce pool can share it.
-pub(crate) fn memfd_create(name: &ffi::CStr, flags: u32) -> io::Result<RawFd> {
-    // SAFETY: FFI call with valid arguments
-    let res = unsafe { libc::syscall(libc::SYS_memfd_create, name.as_ptr(), flags) };
+/// Which step of sealed memfd creation failed.
+pub(crate) enum SealedMemfdError {
+    Create(io::Error),
+    SetSize(io::Error),
+    Seal(io::Error),
+}
 
+/// Create a memfd of `size` bytes, sealed against growing and shrinking.
+///
+/// Consolidates the memfd_create/from_raw_fd/F_ADD_SEALS sequence that
+/// previously lived in `vu_common_ctrl.rs` for the dirty-log shm region,
+/// which now calls this helper too. This is the only unsafe code in the
+/// bounce series and it is a relocation, not an addition.
+pub(crate) fn create_sealed_memfd(name: &ffi::CStr, size: u64) -> Result<File, SealedMemfdError> {
+    // SAFETY: FFI call with valid arguments
+    let res = unsafe {
+        libc::syscall(
+            libc::SYS_memfd_create,
+            name.as_ptr(),
+            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+        )
+    };
     if res < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(res as RawFd)
+        return Err(SealedMemfdError::Create(io::Error::last_os_error()));
     }
+    // SAFETY: memfd_create just returned this valid, owned descriptor.
+    let file = unsafe { File::from_raw_fd(res as RawFd) };
+
+    file.set_len(size).map_err(SealedMemfdError::SetSize)?;
+
+    // SAFETY: FFI call with valid arguments
+    let res = unsafe {
+        libc::fcntl(
+            file.as_raw_fd(),
+            libc::F_ADD_SEALS,
+            libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL,
+        )
+    };
+    if res < 0 {
+        return Err(SealedMemfdError::Seal(io::Error::last_os_error()));
+    }
+
+    Ok(file)
 }
 
 #[cfg(test)]
@@ -194,7 +293,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 4"]
     fn layout_ring_sizes_match_virtio_spec() {
         // Sizes per the virtio 1.x split ring layout, including the
         // event-idx trailing fields.
@@ -209,7 +307,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 4"]
     fn layout_ring_blocks_are_page_aligned_and_disjoint() {
         let pool = BouncePool::new(&layout(3, 256, 8192)).unwrap();
         let mut prev_end = 0u64;
@@ -231,7 +328,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 4"]
     fn new_pool_memory_is_zeroed() {
         let pool = BouncePool::new(&layout(2, 128, 8192)).unwrap();
         for addr in [
@@ -245,7 +341,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 4"]
     fn pool_mem_is_single_region_at_gpa_zero_with_fd() {
         let pool = BouncePool::new(&layout(1, 128, 4096)).unwrap();
         assert_eq!(pool.mem().iter().count(), 1);
@@ -258,7 +353,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 4"]
     fn alloc_returns_gpa_inside_arena() {
         let mut pool = BouncePool::new(&layout(1, 128, 8192)).unwrap();
         let addr = pool.alloc(100).unwrap();
@@ -267,7 +361,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 4"]
     fn alloc_free_roundtrip_scrubs_extent() {
         let mut pool = BouncePool::new(&layout(1, 128, 8192)).unwrap();
         let addr = pool.alloc(256).unwrap();
@@ -279,7 +372,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 4"]
     fn free_bytes_tracks_allocator() {
         let mut pool = BouncePool::new(&layout(1, 128, 8192)).unwrap();
         assert_eq!(pool.free_bytes(), pool.buffer_capacity());
@@ -290,7 +382,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 4"]
     fn zero_rings_clears_only_ring_area() {
         let mut pool = BouncePool::new(&layout(2, 128, 8192)).unwrap();
         let ring_addr = GuestAddress(pool.ring_offsets(1).desc);
@@ -303,7 +394,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 4"]
     fn host_base_offset_math() {
         let pool = BouncePool::new(&layout(1, 128, 4096)).unwrap();
         let offs = pool.ring_offsets(0);
@@ -315,7 +405,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 4"]
     fn memfd_is_sealed() {
         let pool = BouncePool::new(&layout(1, 128, 4096)).unwrap();
         use vm_memory::{GuestMemory, GuestMemoryRegion};

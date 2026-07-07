@@ -3,7 +3,7 @@
 
 use std::fs::File;
 use std::io::{Read, Write};
-use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::io::{AsRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -29,7 +29,7 @@ use vmm_sys_util::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::timerfd::TimerFd;
 
-use super::bounce::pool::memfd_create;
+use super::bounce::pool::{SealedMemfdError, create_sealed_memfd};
 use super::{Error, Result, VhostUserState};
 use crate::vhost_user::Inflight;
 use crate::{
@@ -611,38 +611,21 @@ impl VhostUserHandle {
     }
 
     fn update_log_base(&mut self, last_ram_addr: u64) -> Result<Option<Arc<MmapRegion>>> {
-        // Create the memfd
-        let fd = memfd_create(
-            &ffi::CString::new("vhost_user_dirty_log").unwrap(),
-            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
-        )
-        .map_err(Error::MemfdCreate)?;
-
-        // SAFETY: we checked the file descriptor is valid
-        let file = unsafe { File::from_raw_fd(fd) };
         // The size of the memory mapping corresponds to the size of a bitmap
         // covering all guest pages for addresses from 0 to the last physical
         // address in guest RAM.
         // A page is always 4kiB from a vhost-user perspective, and each bit is
         // a page. That's how we can compute mmap_size from the last address.
         let mmap_size = (last_ram_addr / (VHOST_LOG_PAGE * 8)) + 1;
+
+        // Create the sealed memfd backing the shm_log region.
+        let name = ffi::CString::new("vhost_user_dirty_log").unwrap();
+        let file = create_sealed_memfd(&name, mmap_size).map_err(|e| match e {
+            SealedMemfdError::Create(e) => Error::MemfdCreate(e),
+            SealedMemfdError::SetSize(e) => Error::SetFileSize(e),
+            SealedMemfdError::Seal(e) => Error::SetSeals(e),
+        })?;
         let mmap_handle = file.as_raw_fd();
-
-        // Set shm_log region size
-        file.set_len(mmap_size).map_err(Error::SetFileSize)?;
-
-        // Set the seals
-        // SAFETY: FFI call with valid arguments
-        let res = unsafe {
-            libc::fcntl(
-                file.as_raw_fd(),
-                libc::F_ADD_SEALS,
-                libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL,
-            )
-        };
-        if res < 0 {
-            return Err(Error::SetSeals(io::Error::last_os_error()));
-        }
 
         // Mmap shm_log region
         let region = MmapRegion::build(
