@@ -51,26 +51,36 @@ pub struct BounceSetup<'a> {
 
 /// The memory table sent to a bounce-mode backend: exactly one region,
 /// the pool, presented as the whole guest at GPA 0.
-// TODO: expect(dead_code) is removed when the next commit wires the
-// helper into setup_vhost_user (docs/vhost-user-bounce-plan.md commit 10).
-#[cfg_attr(not(test), expect(dead_code))]
-pub(crate) fn bounce_mem_region(_pool: &BouncePool) -> VhostUserMemoryRegionInfo {
-    todo!("implemented in docs/vhost-user-bounce-plan.md commit 10")
+pub(crate) fn bounce_mem_region(pool: &BouncePool) -> VhostUserMemoryRegionInfo {
+    VhostUserMemoryRegionInfo {
+        guest_phys_addr: 0,
+        memory_size: pool.size(),
+        userspace_addr: pool.host_base(),
+        mmap_offset: 0,
+        mmap_handle: pool.memfd(),
+    }
 }
 
 /// The vring addresses sent to a bounce-mode backend: host addresses of
-/// the shadow rings inside the pool mapping. `queue_size` is the actual
-/// negotiated size, `max_size` the transport maximum.
-// TODO: expect(dead_code) is removed when the next commit wires the
-// helper into setup_vhost_user (docs/vhost-user-bounce-plan.md commit 10).
-#[cfg_attr(not(test), expect(dead_code))]
+/// the shadow rings inside the pool mapping. `queue_index` is the ring
+/// block position within the pool, `queue_size` the actual negotiated
+/// size, `max_size` the transport maximum.
 pub(crate) fn bounce_vring_config(
-    _pool: &BouncePool,
-    _queue_index: usize,
-    _queue_size: u16,
-    _max_size: u16,
+    pool: &BouncePool,
+    queue_index: usize,
+    queue_size: u16,
+    max_size: u16,
 ) -> VringConfigData {
-    todo!("implemented in docs/vhost-user-bounce-plan.md commit 10")
+    let offs = pool.ring_offsets(queue_index);
+    VringConfigData {
+        queue_max_size: max_size,
+        queue_size,
+        flags: 0u32,
+        desc_table_addr: pool.host_base() + offs.desc,
+        used_ring_addr: pool.host_base() + offs.used,
+        avail_ring_addr: pool.host_base() + offs.avail,
+        log_addr: None,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -203,11 +213,20 @@ impl VhostUserHandle {
         backend_req_handler: &Option<FrontendReqHandler<S>>,
         inflight: Option<&mut Inflight>,
         vring_bases: Option<&[u64]>,
+        bounce: Option<&BounceSetup>,
     ) -> Result<()> {
         if let Some(bases) = &vring_bases
             && bases.len() != queues.len()
         {
             return Err(Error::VringBasesCountMismatch(bases.len(), queues.len()));
+        }
+        if let Some(bounce) = &bounce
+            && bounce.fds.len() != queues.len()
+        {
+            return Err(Error::BounceFdsCountMismatch(
+                bounce.fds.len(),
+                queues.len(),
+            ));
         }
 
         self.vu
@@ -217,8 +236,16 @@ impl VhostUserHandle {
         // Update internal value after it's been sent to the backend.
         self.acked_features = acked_features;
 
-        // Let's first provide the memory table to the backend.
-        self.update_mem_table(mem)?;
+        // Let's first provide the memory table to the backend. In bounce
+        // mode the backend never sees guest RAM: its whole "guest" is the
+        // bounce pool.
+        if let Some(bounce) = &bounce {
+            self.vu
+                .set_mem_table(&[bounce_mem_region(bounce.pool)])
+                .map_err(Error::VhostUserSetMemTable)?;
+        } else {
+            self.update_mem_table(mem)?;
+        }
 
         // Send set_vring_num here, since it could tell backends, like SPDK,
         // how many virt queues to be handled, which backend required to know
@@ -255,38 +282,49 @@ impl VhostUserHandle {
         for (i, (queue_index, queue, queue_evt)) in queues.iter().enumerate() {
             let actual_size: usize = queue.size().into();
 
-            let config_data = VringConfigData {
-                queue_max_size: queue.max_size(),
-                queue_size: queue.size(),
-                flags: 0u32,
-                desc_table_addr: get_host_address_range(
-                    mem,
-                    GuestAddress(queue.desc_table()),
-                    actual_size * size_of::<RawDescriptor>(),
-                )
-                .ok_or(Error::DescriptorTableAddress)? as u64,
-                // The used ring is {flags: u16; idx: u16; virtq_used_elem [{id: u16, len: u16}; actual_size]},
-                // i.e. 4 + (4 + 4) * actual_size.
-                used_ring_addr: get_host_address_range(
-                    mem,
-                    GuestAddress(queue.used_ring()),
-                    4 + actual_size * 8,
-                )
-                .ok_or(Error::UsedAddress)? as u64,
-                // The used ring is {flags: u16; idx: u16; elem [u16; actual_size]},
-                // i.e. 4 + (2) * actual_size.
-                avail_ring_addr: get_host_address_range(
-                    mem,
-                    GuestAddress(queue.avail_ring()),
-                    4 + actual_size * 2,
-                )
-                .ok_or(Error::AvailAddress)? as u64,
-                log_addr: None,
+            let config_data = if let Some(bounce) = &bounce {
+                bounce_vring_config(bounce.pool, i, queue.size(), queue.max_size())
+            } else {
+                VringConfigData {
+                    queue_max_size: queue.max_size(),
+                    queue_size: queue.size(),
+                    flags: 0u32,
+                    desc_table_addr: get_host_address_range(
+                        mem,
+                        GuestAddress(queue.desc_table()),
+                        actual_size * size_of::<RawDescriptor>(),
+                    )
+                    .ok_or(Error::DescriptorTableAddress)?
+                        as u64,
+                    // The used ring is {flags: u16; idx: u16; virtq_used_elem [{id: u16, len: u16}; actual_size]},
+                    // i.e. 4 + (4 + 4) * actual_size.
+                    used_ring_addr: get_host_address_range(
+                        mem,
+                        GuestAddress(queue.used_ring()),
+                        4 + actual_size * 8,
+                    )
+                    .ok_or(Error::UsedAddress)? as u64,
+                    // The used ring is {flags: u16; idx: u16; elem [u16; actual_size]},
+                    // i.e. 4 + (2) * actual_size.
+                    avail_ring_addr: get_host_address_range(
+                        mem,
+                        GuestAddress(queue.avail_ring()),
+                        4 + actual_size * 2,
+                    )
+                    .ok_or(Error::AvailAddress)? as u64,
+                    log_addr: None,
+                }
             };
 
             vrings_info.push(VringInfo {
                 config_data,
-                used_guest_addr: queue.used_ring(),
+                used_guest_addr: if let Some(bounce) = &bounce {
+                    // Only used for dirty logging, which bounce devices
+                    // reject; keep the pool-relative address for symmetry.
+                    bounce.pool.ring_offsets(i).used
+                } else {
+                    queue.used_ring()
+                },
             });
 
             self.vu
@@ -304,17 +342,29 @@ impl VhostUserHandle {
                 .set_vring_base(*queue_index, base)
                 .map_err(Error::VhostUserSetVringBase)?;
 
-            if let Some(eventfd) =
-                virtio_interrupt.notifier(VirtioInterruptType::Queue(*queue_index as u16))
-            {
+            if let Some(bounce) = &bounce {
+                // The backend signals completions to the VMM data-plane
+                // worker and receives kicks from it; the guest's irqfd and
+                // ioeventfd stay VMM-side.
                 self.vu
-                    .set_vring_call(*queue_index, &eventfd)
+                    .set_vring_call(*queue_index, &bounce.fds[i].shadow_call)
                     .map_err(Error::VhostUserSetVringCall)?;
-            }
+                self.vu
+                    .set_vring_kick(*queue_index, &bounce.fds[i].shadow_kick)
+                    .map_err(Error::VhostUserSetVringKick)?;
+            } else {
+                if let Some(eventfd) =
+                    virtio_interrupt.notifier(VirtioInterruptType::Queue(*queue_index as u16))
+                {
+                    self.vu
+                        .set_vring_call(*queue_index, &eventfd)
+                        .map_err(Error::VhostUserSetVringCall)?;
+                }
 
-            self.vu
-                .set_vring_kick(*queue_index, queue_evt)
-                .map_err(Error::VhostUserSetVringKick)?;
+                self.vu
+                    .set_vring_kick(*queue_index, queue_evt)
+                    .map_err(Error::VhostUserSetVringKick)?;
+            }
 
             self.queue_indexes.push(*queue_index);
         }
@@ -396,6 +446,7 @@ impl VhostUserHandle {
         acked_protocol_features: u64,
         backend_req_handler: &Option<FrontendReqHandler<S>>,
         inflight: Option<&mut Inflight>,
+        bounce: Option<&BounceSetup>,
     ) -> Result<()> {
         self.set_protocol_features_vhost_user(acked_features, acked_protocol_features)?;
 
@@ -407,6 +458,7 @@ impl VhostUserHandle {
             backend_req_handler,
             inflight,
             None,
+            bounce,
         )
     }
 
@@ -790,7 +842,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 10"]
     fn bounce_mem_region_is_pool_at_gpa_zero() {
         let pool = pool(2, 128);
         let region = bounce_mem_region(&pool);
@@ -802,7 +853,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 10"]
     fn bounce_vring_config_points_into_pool_rings() {
         let pool = pool(2, 256);
         let config = bounce_vring_config(&pool, 1, 256, 256);
@@ -817,7 +867,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 10"]
     fn bounce_vring_config_uses_actual_size_smaller_than_max() {
         let pool = pool(1, 256);
         let config = bounce_vring_config(&pool, 0, 64, 256);

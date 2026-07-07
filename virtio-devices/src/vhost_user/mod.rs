@@ -164,6 +164,8 @@ pub enum Error {
     SaveRestoreBackendState(#[source] io::Error),
     #[error("Vring bases count ({0}) does not match queue count ({1})")]
     VringBasesCountMismatch(usize, usize),
+    #[error("Bounce fds count ({0}) does not match queue count ({1})")]
+    BounceFdsCountMismatch(usize, usize),
     #[error("Backend state and vring bases must both be present or both be absent")]
     InconsistentBackendState,
     #[error("Failed to create timerfd")]
@@ -360,6 +362,7 @@ impl<S: VhostUserFrontendReqHandler> VhostUserEpollHandler<S> {
                 self.acked_protocol_features,
                 &self.backend_req_handler,
                 self.inflight.as_mut(),
+                None,
             )
             .map_err(|e| {
                 EpollHelperError::IoError(io::Error::other(format!(
@@ -524,6 +527,7 @@ impl VhostUserCommon {
                 &backend_req_handler,
                 inflight.as_mut(),
                 vring_bases.as_deref(),
+                None,
             )
             .map_err(ActivateError::VhostUserSetup)?;
 
