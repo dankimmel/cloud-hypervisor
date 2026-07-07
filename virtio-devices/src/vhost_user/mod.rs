@@ -38,6 +38,7 @@ use crate::{
 };
 
 pub mod blk;
+pub mod bounce;
 pub mod fs;
 pub mod generic_vhost_user;
 pub mod net;
