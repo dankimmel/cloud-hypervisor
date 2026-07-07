@@ -1210,7 +1210,6 @@ mod tests {
     // ---- Lifecycle & accounting (unignored in plan commit 8) ----
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 8"]
     fn reset_session_starts_counters_at_base() {
         let mut h = harness(8, 8192);
         h.ring.set_start(&h.mem, 3);
@@ -1231,7 +1230,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 8"]
     fn stall_recovery_after_completion_frees_space() {
         let mut h = harness(8, 256);
         let a = h.ring.alloc_buf(192);
@@ -1267,7 +1265,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 8"]
     fn soak_10k_requests_accounting_converges() {
         let mut h = harness(8, 4096);
         let mut seed = 0x9e37_79b9_7f4a_7c15u64;
@@ -1312,7 +1309,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 8"]
     fn interleaved_two_queue_pool_sharing() {
         // One pool shared by two queues of the same device, each with its
         // own guest ring.
