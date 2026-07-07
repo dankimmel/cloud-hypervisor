@@ -1,0 +1,286 @@
+// Copyright 2026 Cloud Hypervisor Contributors. All Rights Reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! Shared test utilities for the bounce module: a guest-side split ring
+//! builder (acting as the driver) and a fake vhost-user backend that
+//! operates on a [`BouncePool`]'s shadow rings (acting as the daemon).
+
+use std::sync::atomic::Ordering;
+
+use virtio_queue::desc::split::Descriptor;
+use virtio_queue::{Queue, QueueT};
+use vm_memory::{Bytes, GuestAddress};
+
+use super::pool::BouncePool;
+use crate::GuestMemoryMmap;
+
+pub(crate) const GUEST_MEM_SIZE: usize = 0x100_000;
+
+/// Anonymous guest memory for tests: one region at GPA 0.
+pub(crate) fn guest_mem() -> GuestMemoryMmap {
+    GuestMemoryMmap::from_ranges(&[(GuestAddress(0), GUEST_MEM_SIZE)]).unwrap()
+}
+
+/// Builds and manipulates a guest-owned split virtqueue, playing the role
+/// of the guest driver.
+pub(crate) struct GuestRingBuilder {
+    queue_size: u16,
+    desc_table: u64,
+    avail_ring: u64,
+    used_ring: u64,
+    buf_base: u64,
+    start: u16,
+    next_desc: u16,
+    avail_idx: u16,
+    next_buf: u64,
+}
+
+impl GuestRingBuilder {
+    pub(crate) fn new(queue_size: u16) -> Self {
+        Self::new_at(queue_size, 0)
+    }
+
+    /// Lay the ring out at `base` so multiple rings can coexist in one
+    /// guest memory (each ring block uses 0x80000 bytes of address space).
+    pub(crate) fn new_at(queue_size: u16, base: u64) -> Self {
+        GuestRingBuilder {
+            queue_size,
+            desc_table: base + 0x1000,
+            avail_ring: base + 0x3000,
+            used_ring: base + 0x4000,
+            buf_base: base + 0x10000,
+            start: 0,
+            next_desc: 0,
+            avail_idx: 0,
+            next_buf: base + 0x10000,
+        }
+    }
+
+    /// Recycle the guest buffer address space (for soak tests).
+    pub(crate) fn reset_bufs(&mut self) {
+        self.next_buf = self.buf_base;
+    }
+
+    /// Fast-forward the ring to start at index `base` (as after a
+    /// restore): the avail/used indexes begin at `base` and queues
+    /// created afterwards resume from there.
+    pub(crate) fn set_start(&mut self, mem: &GuestMemoryMmap, base: u16) {
+        self.start = base;
+        self.avail_idx = base;
+        mem.store(base, GuestAddress(self.avail_ring + 2), Ordering::Release)
+            .unwrap();
+        mem.store(base, GuestAddress(self.used_ring + 2), Ordering::Release)
+            .unwrap();
+    }
+
+    /// Configure a virtio-queue `Queue` matching this ring.
+    pub(crate) fn queue(&self) -> Queue {
+        let mut q = Queue::new(self.queue_size).unwrap();
+        q.try_set_desc_table_address(GuestAddress(self.desc_table))
+            .unwrap();
+        q.try_set_avail_ring_address(GuestAddress(self.avail_ring))
+            .unwrap();
+        q.try_set_used_ring_address(GuestAddress(self.used_ring))
+            .unwrap();
+        q.set_next_avail(self.start);
+        q.set_next_used(self.start);
+        q.set_ready(true);
+        q
+    }
+
+    /// Reserve a buffer of `len` bytes in guest memory.
+    pub(crate) fn alloc_buf(&mut self, len: u32) -> u64 {
+        let addr = self.next_buf;
+        self.next_buf += u64::from(len).next_multiple_of(64);
+        assert!(self.next_buf <= self.buf_base + 0x70000);
+        addr
+    }
+
+    /// Write one descriptor at `slot`.
+    pub(crate) fn desc(
+        &self,
+        mem: &GuestMemoryMmap,
+        slot: u16,
+        addr: u64,
+        len: u32,
+        flags: u16,
+        next: u16,
+    ) {
+        let desc = Descriptor::new(addr, len, flags, next);
+        mem.write_obj(desc, GuestAddress(self.desc_table + u64::from(slot) * 16))
+            .unwrap();
+    }
+
+    /// Build a descriptor chain out of `(addr, len, writable)` segments
+    /// using sequential descriptor slots; returns the head index. The
+    /// chain is not made available until [`Self::publish`] is called.
+    pub(crate) fn chain(&mut self, mem: &GuestMemoryMmap, segs: &[(u64, u32, bool)]) -> u16 {
+        use virtio_bindings::virtio_ring::{VRING_DESC_F_NEXT, VRING_DESC_F_WRITE};
+        assert!(!segs.is_empty());
+        let head = self.next_desc;
+        for (i, (addr, len, writable)) in segs.iter().enumerate() {
+            let slot = self.next_desc;
+            self.next_desc = (self.next_desc + 1) % self.queue_size;
+            let mut flags = 0u16;
+            if *writable {
+                flags |= VRING_DESC_F_WRITE as u16;
+            }
+            if i + 1 < segs.len() {
+                flags |= VRING_DESC_F_NEXT as u16;
+            }
+            self.desc(mem, slot, *addr, *len, flags, self.next_desc);
+        }
+        head
+    }
+
+    /// Publish `head` in the avail ring and bump the avail index.
+    pub(crate) fn publish(&mut self, mem: &GuestMemoryMmap, head: u16) {
+        let pos = self.avail_idx % self.queue_size;
+        mem.write_obj(head, GuestAddress(self.avail_ring + 4 + u64::from(pos) * 2))
+            .unwrap();
+        self.avail_idx = self.avail_idx.wrapping_add(1);
+        mem.store(
+            self.avail_idx,
+            GuestAddress(self.avail_ring + 2),
+            Ordering::Release,
+        )
+        .unwrap();
+    }
+
+    /// Set the guest avail ring flags (e.g. VRING_AVAIL_F_NO_INTERRUPT).
+    pub(crate) fn set_avail_flags(&self, mem: &GuestMemoryMmap, flags: u16) {
+        mem.store(flags, GuestAddress(self.avail_ring), Ordering::Release)
+            .unwrap();
+    }
+
+    /// Read the guest used ring index (the device publishes this).
+    pub(crate) fn used_idx(&self, mem: &GuestMemoryMmap) -> u16 {
+        mem.load(GuestAddress(self.used_ring + 2), Ordering::Acquire)
+            .unwrap()
+    }
+
+    /// Read the used ring element at ring position `pos` as (id, len).
+    pub(crate) fn used_elem(&self, mem: &GuestMemoryMmap, pos: u16) -> (u32, u32) {
+        let base = self.used_ring + 4 + u64::from(pos % self.queue_size) * 8;
+        (
+            mem.read_obj(GuestAddress(base)).unwrap(),
+            mem.read_obj(GuestAddress(base + 4)).unwrap(),
+        )
+    }
+}
+
+/// Operates on the shadow rings inside a [`BouncePool`] the way a
+/// vhost-user backend would.
+pub(crate) struct FakeDaemon {
+    queue_size: u16,
+    next_avail: Vec<u16>,
+    next_used: Vec<u16>,
+}
+
+impl FakeDaemon {
+    pub(crate) fn new(num_queues: usize, queue_size: u16) -> Self {
+        FakeDaemon {
+            queue_size,
+            next_avail: vec![0; num_queues],
+            next_used: vec![0; num_queues],
+        }
+    }
+
+    /// Resume queue `q` from ring index `base`, as after SET_VRING_BASE.
+    pub(crate) fn set_start(&mut self, q: usize, base: u16) {
+        self.next_avail[q] = base;
+        self.next_used[q] = base;
+    }
+
+    /// Read the shadow avail index for queue `q`.
+    pub(crate) fn avail_idx(&self, pool: &BouncePool, q: usize) -> u16 {
+        let offs = pool.ring_offsets(q);
+        pool.mem()
+            .load(GuestAddress(offs.avail + 2), Ordering::Acquire)
+            .unwrap()
+    }
+
+    /// Read the shadow avail ring flags for queue `q`.
+    pub(crate) fn avail_flags(&self, pool: &BouncePool, q: usize) -> u16 {
+        let offs = pool.ring_offsets(q);
+        pool.mem()
+            .load(GuestAddress(offs.avail), Ordering::Acquire)
+            .unwrap()
+    }
+
+    /// Pop the next shadow avail entry (the shadow head index) for `q`.
+    /// Panics if nothing is available.
+    pub(crate) fn pop_avail(&mut self, pool: &BouncePool, q: usize) -> u16 {
+        assert_ne!(
+            self.avail_idx(pool, q),
+            self.next_avail[q],
+            "no avail entry"
+        );
+        let offs = pool.ring_offsets(q);
+        let pos = self.next_avail[q] % self.queue_size;
+        self.next_avail[q] = self.next_avail[q].wrapping_add(1);
+        pool.mem()
+            .read_obj(GuestAddress(offs.avail + 4 + u64::from(pos) * 2))
+            .unwrap()
+    }
+
+    /// Read the shadow descriptor at `slot` for queue `q`.
+    pub(crate) fn read_desc(&self, pool: &BouncePool, q: usize, slot: u16) -> Descriptor {
+        let offs = pool.ring_offsets(q);
+        pool.mem()
+            .read_obj(GuestAddress(offs.desc + u64::from(slot) * 16))
+            .unwrap()
+    }
+
+    /// Follow a shadow descriptor chain starting at `head`.
+    pub(crate) fn read_chain(&self, pool: &BouncePool, q: usize, head: u16) -> Vec<Descriptor> {
+        let mut descs = Vec::new();
+        let mut slot = head;
+        loop {
+            let desc = self.read_desc(pool, q, slot);
+            let has_next = desc.has_next();
+            slot = desc.next();
+            descs.push(desc);
+            if !has_next {
+                return descs;
+            }
+            assert!(descs.len() <= self.queue_size as usize, "chain loop");
+        }
+    }
+
+    /// Publish a used element for the chain headed by shadow slot `head`,
+    /// reporting `len` written bytes.
+    pub(crate) fn complete(&mut self, pool: &BouncePool, q: usize, head: u16, len: u32) {
+        let offs = pool.ring_offsets(q);
+        let pos = self.next_used[q] % self.queue_size;
+        let base = offs.used + 4 + u64::from(pos) * 8;
+        pool.mem()
+            .write_obj(u32::from(head), GuestAddress(base))
+            .unwrap();
+        pool.mem().write_obj(len, GuestAddress(base + 4)).unwrap();
+        self.next_used[q] = self.next_used[q].wrapping_add(1);
+        pool.mem()
+            .store(
+                self.next_used[q],
+                GuestAddress(offs.used + 2),
+                Ordering::Release,
+            )
+            .unwrap();
+    }
+
+    /// Convenience: pop one avail entry, read its chain, write `fill`
+    /// into every device-writable segment, and complete it reporting the
+    /// number of bytes written. Returns the shadow head.
+    pub(crate) fn serve_one(&mut self, pool: &BouncePool, q: usize, fill: u8) -> u16 {
+        let head = self.pop_avail(pool, q);
+        let chain = self.read_chain(pool, q, head);
+        let mut written = 0u32;
+        for desc in chain.iter().filter(|d| d.is_write_only()) {
+            let data = vec![fill; desc.len() as usize];
+            pool.mem().write_slice(&data, desc.addr()).unwrap();
+            written += desc.len();
+        }
+        self.complete(pool, q, head, written);
+        head
+    }
+}

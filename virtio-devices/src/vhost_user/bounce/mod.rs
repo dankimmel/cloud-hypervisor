@@ -14,11 +14,15 @@
 
 pub mod allocator;
 pub mod pool;
+pub mod shadow_queue;
+#[cfg(test)]
+pub(crate) mod test_utils;
 
 use std::io;
 
 pub use allocator::{BOUNCE_ALLOC_ALIGN, BounceAllocator};
 pub use pool::{BouncePool, PoolLayout, RingOffsets, default_buffer_capacity};
+pub use shadow_queue::{CompleteOutcome, MirrorOutcome, ShadowQueue, ShadowQueueConfig};
 use thiserror::Error;
 use vm_memory::mmap::MmapRegionError;
 use vm_memory::{GuestMemoryError, GuestRegionCollectionError};

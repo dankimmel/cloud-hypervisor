@@ -1,0 +1,1037 @@
+// Copyright 2026 Cloud Hypervisor Contributors. All Rights Reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! Shadow queue translation: mirrors a guest virtqueue into a bounce
+//! pool shadow ring for the backend, and completions back again.
+//!
+//! Design invariants (see `docs/vhost-user-bounce-plan.md` §2.3):
+//!
+//! - The shadow avail/used *index counters* advance in lockstep with the
+//!   guest ring's, so `SET_VRING_BASE` semantics are unchanged.
+//! - Shadow *descriptor slots* are allocated by the VMM from a per-queue
+//!   free stack; used elements coming back from the backend carry shadow
+//!   heads that are translated to guest heads via the in-flight table.
+//! - Ring flags and event-idx fields are never mirrored: the shadow ring
+//!   stays in always-notify mode in both directions, and guest-side
+//!   interrupt suppression is applied by the VMM when completing.
+//! - All guest-controlled data is read exactly once, validated, and
+//!   captured; completions use the captured state (immune to concurrent
+//!   guest descriptor-table rewrites).
+
+use std::num::Wrapping;
+
+use virtio_queue::Queue;
+use vm_memory::GuestAddress;
+
+use super::pool::{BouncePool, RingOffsets};
+use crate::GuestMemoryMmap;
+
+/// Static configuration of one shadow queue.
+#[derive(Clone, Copy)]
+pub struct ShadowQueueConfig {
+    /// Queue index within the device.
+    pub queue_index: usize,
+    /// Actual (negotiated) queue size; at most the pool layout's maximum.
+    pub queue_size: u16,
+}
+
+/// Result of one [`ShadowQueue::mirror_avail`] call.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct MirrorOutcome {
+    /// Chains newly published to the shadow ring. Kick the backend when
+    /// this is non-zero.
+    pub chains: usize,
+    /// The next pending chain could not be translated for lack of pool
+    /// space or shadow descriptor slots; the queue stalls (consuming
+    /// nothing further) until completions free resources.
+    pub stalled: bool,
+}
+
+/// Result of one [`ShadowQueue::complete_used`] call.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct CompleteOutcome {
+    /// Chains completed back into the guest used ring.
+    pub chains: usize,
+    /// Whether the guest should be interrupted for this progress.
+    pub needs_interrupt: bool,
+}
+
+/// One captured guest buffer segment of an in-flight chain.
+// TODO: expect(dead_code) is removed as plan commits 6-7 implement
+// mirror_avail/complete_used (docs/vhost-user-bounce-plan.md).
+#[expect(dead_code)]
+struct Segment {
+    guest_addr: GuestAddress,
+    pool_addr: GuestAddress,
+    len: u32,
+    writable: bool,
+}
+
+/// A chain currently owned by the backend.
+// TODO: expect(dead_code) is removed as plan commits 6-7 implement
+// mirror_avail/complete_used (docs/vhost-user-bounce-plan.md).
+#[expect(dead_code)]
+struct InflightChain {
+    guest_head: u16,
+    segments: Vec<Segment>,
+    /// Shadow descriptor slots used by this chain, head first.
+    slots: Vec<u16>,
+}
+
+/// Mirrors one guest virtqueue into a shadow ring inside the pool.
+// TODO: expect(dead_code) is removed as plan commits 6-8 implement
+// mirror_avail/complete_used (docs/vhost-user-bounce-plan.md).
+#[expect(dead_code)]
+pub struct ShadowQueue {
+    queue_index: usize,
+    size: u16,
+    ring: RingOffsets,
+    /// Free shadow descriptor slots (LIFO).
+    free_slots: Vec<u16>,
+    /// In-flight chains indexed by shadow head slot.
+    inflight: Vec<Option<InflightChain>>,
+    inflight_count: usize,
+    shadow_avail_idx: Wrapping<u16>,
+    /// Next shadow used entry to consume.
+    next_used: Wrapping<u16>,
+    /// Scratch buffer for chunked guest<->pool copies.
+    scratch: Vec<u8>,
+    broken: bool,
+    stalled: bool,
+    /// Set once the current stall episode has been logged.
+    stall_logged: bool,
+}
+
+impl ShadowQueue {
+    /// Create the shadow of a guest queue whose rings live at `ring`
+    /// inside the pool.
+    pub fn new(cfg: ShadowQueueConfig, ring: RingOffsets) -> Self {
+        let size = cfg.queue_size;
+        ShadowQueue {
+            queue_index: cfg.queue_index,
+            size,
+            ring,
+            free_slots: (0..size).rev().collect(),
+            inflight: (0..size).map(|_| None).collect(),
+            inflight_count: 0,
+            shadow_avail_idx: Wrapping(0),
+            next_used: Wrapping(0),
+            scratch: Vec::new(),
+            broken: false,
+            stalled: false,
+            stall_logged: false,
+        }
+    }
+
+    /// Re-initialize counters for a fresh backend session starting at
+    /// `base` (device activation or snapshot restore). Assumes the shadow
+    /// rings have been zeroed and no chain is in flight.
+    pub fn reset_session(&mut self, base: u16) {
+        debug_assert_eq!(self.inflight_count, 0);
+        self.free_slots = (0..self.size).rev().collect();
+        self.inflight = (0..self.size).map(|_| None).collect();
+        self.inflight_count = 0;
+        self.shadow_avail_idx = Wrapping(base);
+        self.next_used = Wrapping(base);
+        self.broken = false;
+        self.stalled = false;
+        self.stall_logged = false;
+    }
+
+    /// Translate new guest avail entries into the shadow ring: allocate
+    /// pool extents, copy device-readable data in, publish rewritten
+    /// descriptor chains.
+    pub fn mirror_avail(
+        &mut self,
+        _guest_mem: &GuestMemoryMmap,
+        _guest_q: &mut Queue,
+        _pool: &mut BouncePool,
+    ) -> MirrorOutcome {
+        todo!("implemented in docs/vhost-user-bounce-plan.md commit 6")
+    }
+
+    /// Consume new shadow used entries: copy device-written data back to
+    /// the captured guest buffers, free + scrub pool extents, publish
+    /// guest used entries.
+    pub fn complete_used(
+        &mut self,
+        _guest_mem: &GuestMemoryMmap,
+        _guest_q: &mut Queue,
+        _pool: &mut BouncePool,
+    ) -> CompleteOutcome {
+        todo!("implemented in docs/vhost-user-bounce-plan.md commit 7")
+    }
+
+    /// Chains currently owned by the backend.
+    pub fn inflight_count(&self) -> usize {
+        self.inflight_count
+    }
+
+    /// A spec violation was detected; the queue no longer processes
+    /// anything (until device reset).
+    pub fn is_broken(&self) -> bool {
+        self.broken
+    }
+
+    /// The queue is waiting for completions to free pool resources.
+    pub fn is_stalled(&self) -> bool {
+        self.stalled
+    }
+
+    /// Whether the current stall episode has been logged (test hook).
+    #[cfg(test)]
+    pub(crate) fn stall_logged(&self) -> bool {
+        self.stall_logged
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use virtio_bindings::virtio_ring::{
+        VRING_AVAIL_F_NO_INTERRUPT, VRING_DESC_F_INDIRECT, VRING_DESC_F_NEXT,
+    };
+    use vm_memory::{Address, Bytes};
+
+    use super::super::pool::PoolLayout;
+    use super::super::test_utils::*;
+    use super::*;
+
+    /// Everything a shadow queue test needs: guest memory with a ring
+    /// builder, a queue, a pool with `arena` buffer bytes, a fake
+    /// backend, and the shadow queue under test.
+    struct Harness {
+        mem: GuestMemoryMmap,
+        ring: GuestRingBuilder,
+        q: Queue,
+        pool: BouncePool,
+        daemon: FakeDaemon,
+        sq: ShadowQueue,
+    }
+
+    fn harness(queue_size: u16, arena: u64) -> Harness {
+        let mem = guest_mem();
+        let ring = GuestRingBuilder::new(queue_size);
+        let q = ring.queue();
+        let pool = BouncePool::new(&PoolLayout {
+            num_queues: 1,
+            queue_size,
+            buffer_capacity: arena,
+        })
+        .unwrap();
+        let sq = ShadowQueue::new(
+            ShadowQueueConfig {
+                queue_index: 0,
+                queue_size,
+            },
+            pool.ring_offsets(0),
+        );
+        Harness {
+            mem,
+            ring,
+            q,
+            pool,
+            daemon: FakeDaemon::new(1, queue_size),
+            sq,
+        }
+    }
+
+    fn fill(mem: &GuestMemoryMmap, addr: u64, len: u32, byte: u8) {
+        mem.write_slice(&vec![byte; len as usize], GuestAddress(addr))
+            .unwrap();
+    }
+
+    fn read_back(mem: &GuestMemoryMmap, addr: u64, len: u32) -> Vec<u8> {
+        let mut buf = vec![0u8; len as usize];
+        mem.read_slice(&mut buf, GuestAddress(addr)).unwrap();
+        buf
+    }
+
+    fn mirror(h: &mut Harness) -> MirrorOutcome {
+        h.sq.mirror_avail(&h.mem, &mut h.q, &mut h.pool)
+    }
+
+    fn complete(h: &mut Harness) -> CompleteOutcome {
+        h.sq.complete_used(&h.mem, &mut h.q, &mut h.pool)
+    }
+
+    // ---- Mirroring (unignored in plan commit 6) ----
+
+    #[test]
+    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 6"]
+    fn mirror_single_readable_descriptor_copies_data_and_publishes() {
+        let mut h = harness(8, 8192);
+        let buf = h.ring.alloc_buf(512);
+        fill(&h.mem, buf, 512, 0x5a);
+        let head = h.ring.chain(&h.mem, &[(buf, 512, false)]);
+        h.ring.publish(&h.mem, head);
+
+        let out = mirror(&mut h);
+        assert_eq!(
+            out,
+            MirrorOutcome {
+                chains: 1,
+                stalled: false
+            }
+        );
+        assert_eq!(h.sq.inflight_count(), 1);
+        assert_eq!(h.daemon.avail_idx(&h.pool, 0), 1);
+
+        let shadow_head = h.daemon.pop_avail(&h.pool, 0);
+        let chain = h.daemon.read_chain(&h.pool, 0, shadow_head);
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].len(), 512);
+        assert!(!chain[0].is_write_only());
+        assert!(chain[0].addr().raw_value() >= h.pool.arena_base());
+        assert_eq!(
+            read_back(h.pool.mem(), chain[0].addr().raw_value(), 512),
+            vec![0x5a; 512]
+        );
+    }
+
+    #[test]
+    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 6"]
+    fn mirror_writable_descriptor_allocates_but_does_not_copy() {
+        let mut h = harness(8, 8192);
+        let buf = h.ring.alloc_buf(256);
+        fill(&h.mem, buf, 256, 0xab);
+        let head = h.ring.chain(&h.mem, &[(buf, 256, true)]);
+        h.ring.publish(&h.mem, head);
+
+        assert_eq!(mirror(&mut h).chains, 1);
+        let shadow_head = h.daemon.pop_avail(&h.pool, 0);
+        let chain = h.daemon.read_chain(&h.pool, 0, shadow_head);
+        assert!(chain[0].is_write_only());
+        // Guest data must not leak into the pool for writable buffers.
+        assert_eq!(
+            read_back(h.pool.mem(), chain[0].addr().raw_value(), 256),
+            vec![0u8; 256]
+        );
+    }
+
+    #[test]
+    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 6"]
+    fn mirror_chain_preserves_order_flags_and_linkage() {
+        let mut h = harness(8, 8192);
+        let (a, b, c) = (
+            h.ring.alloc_buf(0x100),
+            h.ring.alloc_buf(0x200),
+            h.ring.alloc_buf(0x40),
+        );
+        fill(&h.mem, a, 0x100, 1);
+        let head = h.ring.chain(
+            &h.mem,
+            &[(a, 0x100, false), (b, 0x200, true), (c, 0x40, true)],
+        );
+        h.ring.publish(&h.mem, head);
+
+        assert_eq!(mirror(&mut h).chains, 1);
+        let shadow_head = h.daemon.pop_avail(&h.pool, 0);
+        let chain = h.daemon.read_chain(&h.pool, 0, shadow_head);
+        assert_eq!(chain.len(), 3);
+        assert_eq!(
+            chain.iter().map(|d| d.len()).collect::<Vec<_>>(),
+            vec![0x100, 0x200, 0x40]
+        );
+        assert_eq!(
+            chain.iter().map(|d| d.is_write_only()).collect::<Vec<_>>(),
+            vec![false, true, true]
+        );
+    }
+
+    #[test]
+    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 6"]
+    fn mirror_multiple_chains_in_one_call() {
+        let mut h = harness(8, 8192);
+        for _ in 0..3 {
+            let buf = h.ring.alloc_buf(64);
+            let head = h.ring.chain(&h.mem, &[(buf, 64, false)]);
+            h.ring.publish(&h.mem, head);
+        }
+        let out = mirror(&mut h);
+        assert_eq!(
+            out,
+            MirrorOutcome {
+                chains: 3,
+                stalled: false
+            }
+        );
+        assert_eq!(h.daemon.avail_idx(&h.pool, 0), 3);
+        let heads: Vec<u16> = (0..3).map(|_| h.daemon.pop_avail(&h.pool, 0)).collect();
+        assert_eq!(heads.len(), 3);
+        assert!(heads.windows(2).all(|w| w[0] != w[1]));
+    }
+
+    #[test]
+    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 6"]
+    fn mirror_idle_when_no_new_entries() {
+        let mut h = harness(8, 8192);
+        let buf = h.ring.alloc_buf(64);
+        let head = h.ring.chain(&h.mem, &[(buf, 64, false)]);
+        h.ring.publish(&h.mem, head);
+        assert_eq!(mirror(&mut h).chains, 1);
+        assert_eq!(
+            mirror(&mut h),
+            MirrorOutcome {
+                chains: 0,
+                stalled: false
+            }
+        );
+    }
+
+    #[test]
+    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 6"]
+    fn mirror_zero_length_descriptor() {
+        let mut h = harness(8, 8192);
+        let (a, b) = (h.ring.alloc_buf(64), h.ring.alloc_buf(64));
+        let head = h.ring.chain(&h.mem, &[(a, 0, false), (b, 16, true)]);
+        h.ring.publish(&h.mem, head);
+        assert_eq!(mirror(&mut h).chains, 1);
+        // Only the 16-byte segment consumes arena space (rounded to 64).
+        assert_eq!(h.pool.free_bytes(), h.pool.buffer_capacity() - 64);
+        let shadow_head = h.daemon.pop_avail(&h.pool, 0);
+        let chain = h.daemon.read_chain(&h.pool, 0, shadow_head);
+        assert_eq!(chain[0].len(), 0);
+        assert_eq!(chain[1].len(), 16);
+    }
+
+    #[test]
+    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 6"]
+    fn mirror_does_not_forward_guest_no_interrupt_flag() {
+        let mut h = harness(8, 8192);
+        h.ring
+            .set_avail_flags(&h.mem, VRING_AVAIL_F_NO_INTERRUPT as u16);
+        let buf = h.ring.alloc_buf(64);
+        let head = h.ring.chain(&h.mem, &[(buf, 64, false)]);
+        h.ring.publish(&h.mem, head);
+        assert_eq!(mirror(&mut h).chains, 1);
+        assert_eq!(h.daemon.avail_flags(&h.pool, 0), 0);
+    }
+
+    #[test]
+    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 6"]
+    fn mirror_uses_shadow_allocated_slots() {
+        let mut h = harness(8, 8192);
+        // Burn guest descriptor slots 0..5 on unpublished chains so the
+        // published chain's guest head is 5.
+        for _ in 0..5 {
+            let buf = h.ring.alloc_buf(16);
+            h.ring.chain(&h.mem, &[(buf, 16, false)]);
+        }
+        let buf = h.ring.alloc_buf(16);
+        let head = h.ring.chain(&h.mem, &[(buf, 16, false)]);
+        assert_eq!(head, 5);
+        h.ring.publish(&h.mem, head);
+        assert_eq!(mirror(&mut h).chains, 1);
+        // Shadow slots come from the VMM's own free stack, starting at 0.
+        assert_eq!(h.daemon.pop_avail(&h.pool, 0), 0);
+    }
+
+    #[test]
+    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 6"]
+    fn mirror_indirect_flag_marks_queue_broken() {
+        let mut h = harness(8, 8192);
+        let table = h.ring.alloc_buf(64);
+        h.ring
+            .desc(&h.mem, 0, table, 16, VRING_DESC_F_INDIRECT as u16, 0);
+        h.ring.publish(&h.mem, 0);
+        assert_eq!(
+            mirror(&mut h),
+            MirrorOutcome {
+                chains: 0,
+                stalled: false
+            }
+        );
+        assert!(h.sq.is_broken());
+        // Broken queues consume nothing further.
+        let buf = h.ring.alloc_buf(64);
+        let head = h.ring.chain(&h.mem, &[(buf, 64, false)]);
+        h.ring.publish(&h.mem, head);
+        assert_eq!(mirror(&mut h).chains, 0);
+    }
+
+    #[test]
+    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 6"]
+    fn mirror_chain_longer_than_queue_marks_queue_broken() {
+        let mut h = harness(4, 8192);
+        let buf = h.ring.alloc_buf(64);
+        // 0 -> 1 -> 2 -> 3 -> 0: a descriptor loop.
+        for slot in 0u16..4 {
+            h.ring.desc(
+                &h.mem,
+                slot,
+                buf,
+                16,
+                VRING_DESC_F_NEXT as u16,
+                (slot + 1) % 4,
+            );
+        }
+        h.ring.publish(&h.mem, 0);
+        assert_eq!(mirror(&mut h).chains, 0);
+        assert!(h.sq.is_broken());
+    }
+
+    #[test]
+    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 6"]
+    fn mirror_desc_addr_outside_guest_memory_marks_queue_broken() {
+        let mut h = harness(8, 8192);
+        let head = h.ring.chain(&h.mem, &[(0xdead_0000_0000, 64, false)]);
+        h.ring.publish(&h.mem, head);
+        assert_eq!(mirror(&mut h).chains, 0);
+        assert!(h.sq.is_broken());
+        assert_eq!(h.pool.free_bytes(), h.pool.buffer_capacity());
+    }
+
+    // ---- Backpressure (unignored in plan commit 6) ----
+
+    #[test]
+    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 6"]
+    fn mirror_stalls_when_arena_exhausted_and_rolls_back() {
+        let mut h = harness(8, 256);
+        let a = h.ring.alloc_buf(192);
+        let head = h.ring.chain(&h.mem, &[(a, 192, false)]);
+        h.ring.publish(&h.mem, head);
+        assert_eq!(
+            mirror(&mut h),
+            MirrorOutcome {
+                chains: 1,
+                stalled: false
+            }
+        );
+
+        let b = h.ring.alloc_buf(128);
+        let head = h.ring.chain(&h.mem, &[(b, 128, false)]);
+        h.ring.publish(&h.mem, head);
+        let out = mirror(&mut h);
+        assert_eq!(
+            out,
+            MirrorOutcome {
+                chains: 0,
+                stalled: true
+            }
+        );
+        assert!(h.sq.is_stalled());
+        // Rollback: no partial allocation, nothing extra in flight.
+        assert_eq!(h.pool.free_bytes(), 256 - 192);
+        assert_eq!(h.sq.inflight_count(), 1);
+        assert_eq!(h.daemon.avail_idx(&h.pool, 0), 1);
+    }
+
+    #[test]
+    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 6"]
+    fn mirror_stall_is_all_or_nothing_across_chains() {
+        let mut h = harness(8, 256);
+        let a = h.ring.alloc_buf(128);
+        let head = h.ring.chain(&h.mem, &[(a, 128, false)]);
+        h.ring.publish(&h.mem, head);
+        let b = h.ring.alloc_buf(192);
+        let head = h.ring.chain(&h.mem, &[(b, 192, false)]);
+        h.ring.publish(&h.mem, head);
+
+        let out = mirror(&mut h);
+        assert_eq!(
+            out,
+            MirrorOutcome {
+                chains: 1,
+                stalled: true
+            }
+        );
+        assert_eq!(h.daemon.avail_idx(&h.pool, 0), 1);
+        assert_eq!(h.pool.free_bytes(), 256 - 128);
+    }
+
+    #[test]
+    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 6"]
+    fn mirror_oversized_chain_sets_permanent_stall_and_logs_once() {
+        let mut h = harness(8, 256);
+        let a = h.ring.alloc_buf(512);
+        let head = h.ring.chain(&h.mem, &[(a, 512, false)]);
+        h.ring.publish(&h.mem, head);
+        assert_eq!(
+            mirror(&mut h),
+            MirrorOutcome {
+                chains: 0,
+                stalled: true
+            }
+        );
+        assert!(h.sq.is_stalled());
+        assert!(h.sq.stall_logged());
+        // Still stalled on retry; the episode is only logged once.
+        assert_eq!(
+            mirror(&mut h),
+            MirrorOutcome {
+                chains: 0,
+                stalled: true
+            }
+        );
+        assert!(h.sq.stall_logged());
+    }
+
+    #[test]
+    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 6"]
+    fn mirror_slot_exhaustion_stalls() {
+        let mut h = harness(2, 1 << 20);
+        for _ in 0..3 {
+            let buf = h.ring.alloc_buf(64);
+            let head = h.ring.chain(&h.mem, &[(buf, 64, false)]);
+            h.ring.publish(&h.mem, head);
+        }
+        let out = mirror(&mut h);
+        assert_eq!(
+            out,
+            MirrorOutcome {
+                chains: 2,
+                stalled: true
+            }
+        );
+    }
+
+    // ---- Completion (unignored in plan commit 7) ----
+
+    #[test]
+    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 7"]
+    fn complete_copies_back_writable_data_and_publishes_guest_used() {
+        let mut h = harness(8, 8192);
+        let (req, resp) = (h.ring.alloc_buf(64), h.ring.alloc_buf(256));
+        fill(&h.mem, req, 64, 0x11);
+        let head = h.ring.chain(&h.mem, &[(req, 64, false), (resp, 256, true)]);
+        h.ring.publish(&h.mem, head);
+        assert_eq!(mirror(&mut h).chains, 1);
+
+        h.daemon.serve_one(&h.pool, 0, 0x77);
+        let out = complete(&mut h);
+        assert_eq!(out.chains, 1);
+        assert!(out.needs_interrupt);
+        assert_eq!(read_back(&h.mem, resp, 256), vec![0x77; 256]);
+        assert_eq!(h.ring.used_idx(&h.mem), 1);
+        assert_eq!(h.ring.used_elem(&h.mem, 0), (u32::from(head), 256));
+        assert_eq!(h.sq.inflight_count(), 0);
+    }
+
+    #[test]
+    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 7"]
+    fn complete_respects_daemon_len_cap() {
+        let mut h = harness(8, 8192);
+        let resp = h.ring.alloc_buf(256);
+        fill(&h.mem, resp, 256, 0xee); // sentinel
+        let head = h.ring.chain(&h.mem, &[(resp, 256, true)]);
+        h.ring.publish(&h.mem, head);
+        assert_eq!(mirror(&mut h).chains, 1);
+
+        let shadow_head = h.daemon.pop_avail(&h.pool, 0);
+        let chain = h.daemon.read_chain(&h.pool, 0, shadow_head);
+        h.pool
+            .mem()
+            .write_slice(&[0x33; 256], chain[0].addr())
+            .unwrap();
+        h.daemon.complete(&h.pool, 0, shadow_head, 4);
+
+        assert_eq!(complete(&mut h).chains, 1);
+        let got = read_back(&h.mem, resp, 256);
+        assert_eq!(&got[..4], &[0x33; 4]);
+        assert_eq!(&got[4..], &[0xee; 252][..]);
+        assert_eq!(h.ring.used_elem(&h.mem, 0), (u32::from(head), 4));
+    }
+
+    #[test]
+    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 7"]
+    fn complete_caps_len_at_writable_total() {
+        let mut h = harness(8, 8192);
+        let (req, resp) = (h.ring.alloc_buf(64), h.ring.alloc_buf(128));
+        let head = h.ring.chain(&h.mem, &[(req, 64, false), (resp, 128, true)]);
+        h.ring.publish(&h.mem, head);
+        assert_eq!(mirror(&mut h).chains, 1);
+
+        let shadow_head = h.daemon.pop_avail(&h.pool, 0);
+        // The daemon lies: reports more written than the writable total.
+        h.daemon.complete(&h.pool, 0, shadow_head, 9999);
+        assert_eq!(complete(&mut h).chains, 1);
+        assert_eq!(h.ring.used_elem(&h.mem, 0), (u32::from(head), 128));
+    }
+
+    #[test]
+    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 7"]
+    fn complete_readonly_chain_copies_nothing() {
+        let mut h = harness(8, 8192);
+        let req = h.ring.alloc_buf(64);
+        fill(&h.mem, req, 64, 0x44);
+        let head = h.ring.chain(&h.mem, &[(req, 64, false)]);
+        h.ring.publish(&h.mem, head);
+        assert_eq!(mirror(&mut h).chains, 1);
+
+        h.daemon.serve_one(&h.pool, 0, 0x99);
+        assert_eq!(complete(&mut h).chains, 1);
+        assert_eq!(read_back(&h.mem, req, 64), vec![0x44; 64]);
+        assert_eq!(h.ring.used_elem(&h.mem, 0), (u32::from(head), 0));
+    }
+
+    #[test]
+    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 7"]
+    fn complete_frees_and_scrubs_extents_and_recycles_slots() {
+        let mut h = harness(2, 8192);
+        let resp = h.ring.alloc_buf(128);
+        let head = h.ring.chain(&h.mem, &[(resp, 128, true)]);
+        h.ring.publish(&h.mem, head);
+        assert_eq!(mirror(&mut h).chains, 1);
+        let shadow_head = h.daemon.pop_avail(&h.pool, 0);
+        let chain = h.daemon.read_chain(&h.pool, 0, shadow_head);
+        let pool_addr = chain[0].addr();
+        h.pool.mem().write_slice(&[0x55; 128], pool_addr).unwrap();
+        h.daemon.complete(&h.pool, 0, shadow_head, 128);
+        assert_eq!(complete(&mut h).chains, 1);
+
+        assert_eq!(h.pool.free_bytes(), h.pool.buffer_capacity());
+        assert_eq!(
+            read_back(h.pool.mem(), pool_addr.raw_value(), 128),
+            vec![0u8; 128]
+        );
+
+        // The freed slot can immediately serve another chain (queue size
+        // 2, so exhaustion would show if slots leaked).
+        for _ in 0..4 {
+            let buf = h.ring.alloc_buf(64);
+            let head = h.ring.chain(&h.mem, &[(buf, 64, true)]);
+            h.ring.publish(&h.mem, head);
+            assert_eq!(mirror(&mut h).chains, 1);
+            h.daemon.serve_one(&h.pool, 0, 1);
+            assert_eq!(complete(&mut h).chains, 1);
+        }
+    }
+
+    #[test]
+    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 7"]
+    fn complete_out_of_order_completions() {
+        let mut h = harness(8, 8192);
+        let mut heads = Vec::new();
+        let mut bufs = Vec::new();
+        for _ in 0..2 {
+            let buf = h.ring.alloc_buf(64);
+            let head = h.ring.chain(&h.mem, &[(buf, 64, true)]);
+            h.ring.publish(&h.mem, head);
+            heads.push(head);
+            bufs.push(buf);
+        }
+        assert_eq!(mirror(&mut h).chains, 2);
+        let s0 = h.daemon.pop_avail(&h.pool, 0);
+        let s1 = h.daemon.pop_avail(&h.pool, 0);
+
+        // Complete the second submission first.
+        h.daemon.complete(&h.pool, 0, s1, 64);
+        assert_eq!(complete(&mut h).chains, 1);
+        assert_eq!(h.ring.used_elem(&h.mem, 0), (u32::from(heads[1]), 64));
+
+        h.daemon.complete(&h.pool, 0, s0, 64);
+        assert_eq!(complete(&mut h).chains, 1);
+        assert_eq!(h.ring.used_elem(&h.mem, 1), (u32::from(heads[0]), 64));
+        assert_eq!(h.ring.used_idx(&h.mem), 2);
+    }
+
+    #[test]
+    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 7"]
+    fn complete_multiple_in_one_call() {
+        let mut h = harness(8, 8192);
+        for _ in 0..3 {
+            let buf = h.ring.alloc_buf(64);
+            let head = h.ring.chain(&h.mem, &[(buf, 64, true)]);
+            h.ring.publish(&h.mem, head);
+        }
+        assert_eq!(mirror(&mut h).chains, 3);
+        for _ in 0..3 {
+            h.daemon.serve_one(&h.pool, 0, 9);
+        }
+        let out = complete(&mut h);
+        assert_eq!(out.chains, 3);
+        assert_eq!(h.ring.used_idx(&h.mem), 3);
+    }
+
+    #[test]
+    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 7"]
+    fn complete_idle_when_no_new_used() {
+        let mut h = harness(8, 8192);
+        assert_eq!(
+            complete(&mut h),
+            CompleteOutcome {
+                chains: 0,
+                needs_interrupt: false
+            }
+        );
+    }
+
+    #[test]
+    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 7"]
+    fn mirror_and_complete_wrap_indices() {
+        let mut h = harness(4, 8192);
+        // Drive enough traffic through a tiny queue to wrap the ring
+        // positions many times over.
+        for round in 0..40u32 {
+            let buf = h.ring.alloc_buf(64);
+            fill(&h.mem, buf, 64, round as u8);
+            let head = h.ring.chain(&h.mem, &[(buf, 64, true)]);
+            h.ring.publish(&h.mem, head);
+            assert_eq!(mirror(&mut h).chains, 1, "round {round}");
+            h.daemon.serve_one(&h.pool, 0, round as u8);
+            assert_eq!(complete(&mut h).chains, 1, "round {round}");
+            assert_eq!(read_back(&h.mem, buf, 64), vec![round as u8; 64]);
+        }
+        assert_eq!(h.ring.used_idx(&h.mem), 40);
+        assert_eq!(h.pool.free_bytes(), h.pool.buffer_capacity());
+    }
+
+    #[test]
+    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 7"]
+    fn complete_unknown_id_marks_queue_broken() {
+        let mut h = harness(8, 8192);
+        h.daemon.complete(&h.pool, 0, 3, 0);
+        let out = complete(&mut h);
+        assert_eq!(out.chains, 0);
+        assert!(h.sq.is_broken());
+    }
+
+    #[test]
+    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 7"]
+    fn complete_stale_duplicate_id_marks_queue_broken() {
+        let mut h = harness(8, 8192);
+        let buf = h.ring.alloc_buf(64);
+        let head = h.ring.chain(&h.mem, &[(buf, 64, true)]);
+        h.ring.publish(&h.mem, head);
+        assert_eq!(mirror(&mut h).chains, 1);
+        let shadow_head = h.daemon.pop_avail(&h.pool, 0);
+        h.daemon.complete(&h.pool, 0, shadow_head, 64);
+        assert_eq!(complete(&mut h).chains, 1);
+        // The daemon completes the same shadow head again.
+        h.daemon.complete(&h.pool, 0, shadow_head, 64);
+        assert_eq!(complete(&mut h).chains, 0);
+        assert!(h.sq.is_broken());
+    }
+
+    #[test]
+    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 7"]
+    fn complete_honors_guest_no_interrupt_flag() {
+        let mut h = harness(8, 8192);
+        h.ring
+            .set_avail_flags(&h.mem, VRING_AVAIL_F_NO_INTERRUPT as u16);
+        let buf = h.ring.alloc_buf(64);
+        let head = h.ring.chain(&h.mem, &[(buf, 64, true)]);
+        h.ring.publish(&h.mem, head);
+        assert_eq!(mirror(&mut h).chains, 1);
+        h.daemon.serve_one(&h.pool, 0, 1);
+        let out = complete(&mut h);
+        assert_eq!(out.chains, 1);
+        assert!(!out.needs_interrupt);
+
+        // With the flag cleared, completions do interrupt.
+        h.ring.set_avail_flags(&h.mem, 0);
+        let buf = h.ring.alloc_buf(64);
+        let head = h.ring.chain(&h.mem, &[(buf, 64, true)]);
+        h.ring.publish(&h.mem, head);
+        assert_eq!(mirror(&mut h).chains, 1);
+        h.daemon.serve_one(&h.pool, 0, 2);
+        assert!(complete(&mut h).needs_interrupt);
+    }
+
+    #[test]
+    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 7"]
+    fn complete_uses_captured_segments_not_live_desc_table() {
+        let mut h = harness(8, 8192);
+        let (buf1, buf2) = (h.ring.alloc_buf(64), h.ring.alloc_buf(64));
+        fill(&h.mem, buf2, 64, 0xcc); // sentinel in the decoy buffer
+        let head = h.ring.chain(&h.mem, &[(buf1, 64, true)]);
+        h.ring.publish(&h.mem, head);
+        assert_eq!(mirror(&mut h).chains, 1);
+
+        // The (misbehaving) guest redirects the descriptor after submit.
+        h.ring.desc(&h.mem, head, buf2, 64, 0, 0);
+
+        h.daemon.serve_one(&h.pool, 0, 0x77);
+        assert_eq!(complete(&mut h).chains, 1);
+        // Copy-back lands at the captured address, not the rewritten one.
+        assert_eq!(read_back(&h.mem, buf1, 64), vec![0x77; 64]);
+        assert_eq!(read_back(&h.mem, buf2, 64), vec![0xcc; 64]);
+    }
+
+    #[test]
+    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 7"]
+    fn broken_queue_complete_is_idle() {
+        let mut h = harness(8, 8192);
+        h.daemon.complete(&h.pool, 0, 5, 0);
+        assert_eq!(complete(&mut h).chains, 0);
+        assert!(h.sq.is_broken());
+        // Even valid-looking completions are ignored once broken.
+        h.daemon.complete(&h.pool, 0, 0, 0);
+        assert_eq!(
+            complete(&mut h),
+            CompleteOutcome {
+                chains: 0,
+                needs_interrupt: false
+            }
+        );
+    }
+
+    // ---- Lifecycle & accounting (unignored in plan commit 8) ----
+
+    #[test]
+    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 8"]
+    fn reset_session_starts_counters_at_base() {
+        let mut h = harness(8, 8192);
+        h.ring.set_start(&h.mem, 3);
+        h.q = h.ring.queue();
+        h.sq.reset_session(3);
+        h.daemon = FakeDaemon::new(1, 8);
+        h.daemon.set_start(0, 3);
+        // Pretend the shadow avail idx was restored to base 3.
+        let buf = h.ring.alloc_buf(64);
+        let head = h.ring.chain(&h.mem, &[(buf, 64, true)]);
+        h.ring.publish(&h.mem, head);
+        assert_eq!(mirror(&mut h).chains, 1);
+        assert_eq!(h.daemon.avail_idx(&h.pool, 0), 4);
+        h.daemon.serve_one(&h.pool, 0, 5);
+        assert_eq!(complete(&mut h).chains, 1);
+        assert_eq!(h.ring.used_idx(&h.mem), 4);
+        assert_eq!(h.sq.inflight_count(), 0);
+    }
+
+    #[test]
+    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 8"]
+    fn stall_recovery_after_completion_frees_space() {
+        let mut h = harness(8, 256);
+        let a = h.ring.alloc_buf(192);
+        let head = h.ring.chain(&h.mem, &[(a, 192, true)]);
+        h.ring.publish(&h.mem, head);
+        assert_eq!(mirror(&mut h).chains, 1);
+
+        let b = h.ring.alloc_buf(128);
+        let head_b = h.ring.chain(&h.mem, &[(b, 128, true)]);
+        h.ring.publish(&h.mem, head_b);
+        assert_eq!(
+            mirror(&mut h),
+            MirrorOutcome {
+                chains: 0,
+                stalled: true
+            }
+        );
+        assert!(h.sq.is_stalled());
+
+        // Completion frees 192 bytes; the retry then succeeds.
+        h.daemon.serve_one(&h.pool, 0, 1);
+        assert_eq!(complete(&mut h).chains, 1);
+        let out = mirror(&mut h);
+        assert_eq!(
+            out,
+            MirrorOutcome {
+                chains: 1,
+                stalled: false
+            }
+        );
+        assert!(!h.sq.is_stalled());
+        assert!(!h.sq.stall_logged());
+    }
+
+    #[test]
+    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 8"]
+    fn soak_10k_requests_accounting_converges() {
+        let mut h = harness(8, 4096);
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut submitted = 0u32;
+        for _ in 0..10_000 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let len = 1 + ((seed >> 33) % 1024) as u32;
+            let buf = h.ring.alloc_buf(len);
+            let head = h.ring.chain(&h.mem, &[(buf, len, (seed & 1) == 1)]);
+            h.ring.publish(&h.mem, head);
+            let out = mirror(&mut h);
+            assert!(!h.sq.is_broken());
+            submitted += out.chains as u32;
+            // Periodically drain everything in flight to unstall.
+            if h.sq.is_stalled() || h.sq.inflight_count() >= 6 {
+                while h.sq.inflight_count() > 0 {
+                    h.daemon.serve_one(&h.pool, 0, seed as u8);
+                    complete(&mut h);
+                }
+                submitted += mirror(&mut h).chains as u32;
+            }
+            // The builder recycles guest buffer space.
+            h.ring.reset_bufs();
+        }
+        // Drain the tail: complete everything in flight and mirror any
+        // entries still pending from stalls near the end.
+        loop {
+            while h.sq.inflight_count() > 0 {
+                h.daemon.serve_one(&h.pool, 0, 0);
+                complete(&mut h);
+            }
+            let out = mirror(&mut h);
+            submitted += out.chains as u32;
+            if out.chains == 0 && !out.stalled {
+                break;
+            }
+        }
+        assert_eq!(submitted, 10_000);
+        assert_eq!(h.pool.free_bytes(), h.pool.buffer_capacity());
+        assert!(!h.sq.is_broken());
+        assert_eq!(h.sq.inflight_count(), 0);
+    }
+
+    #[test]
+    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 8"]
+    fn interleaved_two_queue_pool_sharing() {
+        // One pool shared by two queues of the same device, each with its
+        // own guest ring.
+        let mem = guest_mem();
+        let mut pool = BouncePool::new(&PoolLayout {
+            num_queues: 2,
+            queue_size: 8,
+            buffer_capacity: 256,
+        })
+        .unwrap();
+        let mut ring0 = GuestRingBuilder::new(8);
+        let mut ring1 = GuestRingBuilder::new_at(8, 0x80000);
+        let mut q0 = ring0.queue();
+        let mut q1 = ring1.queue();
+        let mut sq0 = ShadowQueue::new(
+            ShadowQueueConfig {
+                queue_index: 0,
+                queue_size: 8,
+            },
+            pool.ring_offsets(0),
+        );
+        let mut sq1 = ShadowQueue::new(
+            ShadowQueueConfig {
+                queue_index: 1,
+                queue_size: 8,
+            },
+            pool.ring_offsets(1),
+        );
+        let mut daemon = FakeDaemon::new(2, 8);
+
+        // Queue 0 takes the whole arena.
+        let a = ring0.alloc_buf(256);
+        let head = ring0.chain(&mem, &[(a, 256, true)]);
+        ring0.publish(&mem, head);
+        assert_eq!(sq0.mirror_avail(&mem, &mut q0, &mut pool).chains, 1);
+        assert_eq!(pool.free_bytes(), 0);
+
+        // Queue 1 stalls for space.
+        let b = ring1.alloc_buf(128);
+        let head_b = ring1.chain(&mem, &[(b, 128, true)]);
+        ring1.publish(&mem, head_b);
+        let out = sq1.mirror_avail(&mem, &mut q1, &mut pool);
+        assert_eq!(
+            out,
+            MirrorOutcome {
+                chains: 0,
+                stalled: true
+            }
+        );
+
+        // Completing queue 0's chain frees space for queue 1.
+        daemon.serve_one(&pool, 0, 7);
+        assert_eq!(sq0.complete_used(&mem, &mut q0, &mut pool).chains, 1);
+        let out = sq1.mirror_avail(&mem, &mut q1, &mut pool);
+        assert_eq!(
+            out,
+            MirrorOutcome {
+                chains: 1,
+                stalled: false
+            }
+        );
+    }
+}
