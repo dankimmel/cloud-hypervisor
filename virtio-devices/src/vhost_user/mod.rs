@@ -20,7 +20,7 @@ use vhost::vhost_user::message::{
     VhostUserInflight, VhostUserProtocolFeatures, VhostUserVirtioFeatures,
 };
 use vhost::vhost_user::{Error as VhostUserError, FrontendReqHandler, VhostUserFrontendReqHandler};
-use virtio_queue::{Error as QueueError, Queue};
+use virtio_queue::{Error as QueueError, Queue, QueueT};
 use vm_memory::guest_memory::Error as MmapError;
 use vm_memory::mmap::MmapRegionError;
 use vm_memory::{Address, GuestAddressSpace, GuestMemory, GuestMemoryAtomic};
@@ -479,6 +479,95 @@ pub struct VhostUserCommon {
     dirty_logging: bool,
 }
 
+/// Build the per-queue shadow queues, hand the backend the pool memory
+/// table and shadow rings via `setup_vhost_user`, and construct the
+/// data-plane worker. Called from `activate` when bounce is enabled.
+#[expect(clippy::too_many_arguments)]
+fn setup_bounce_session<T: VhostUserFrontendReqHandler>(
+    bstate: &bounce::BounceState,
+    vu: &Arc<Mutex<VhostUserHandle>>,
+    mem: &GuestMemoryAtomic<GuestMemoryMmap>,
+    queues: &[(usize, Queue, EventFd)],
+    interrupt_cb: Arc<dyn VirtioInterrupt>,
+    acked_features: u64,
+    backend_req_handler: &Option<FrontendReqHandler<T>>,
+    inflight: Option<&mut Inflight>,
+    vring_bases: Option<&[u64]>,
+    bounce_kill: EventFd,
+    bounce_pause: EventFd,
+) -> result::Result<bounce::BounceEpollHandler, ActivateError> {
+    let mem_ref = mem.memory();
+    let mut guard = bstate.shared.lock().unwrap();
+    guard.shadow.clear();
+    for (i, (qidx, queue, _)) in queues.iter().enumerate() {
+        // The shadow avail index must start at the same base the backend
+        // is given via SET_VRING_BASE (see setup_vhost_user).
+        let base = match vring_bases {
+            Some(b) => b[i] as u16,
+            None => queue
+                .avail_idx(mem_ref.deref(), Ordering::Acquire)
+                .map(|idx| idx.0)
+                .map_err(|_| ActivateError::BadActivate)?,
+        };
+        let ring = guard.pool.ring_offsets(i);
+        let mut sq = bounce::ShadowQueue::new(
+            bounce::ShadowQueueConfig {
+                queue_index: *qidx,
+                queue_size: queue.size(),
+            },
+            ring,
+        );
+        sq.reset_session(base);
+        guard.shadow.push(sq);
+    }
+    guard
+        .pool
+        .zero_rings()
+        .map_err(|_| ActivateError::BadActivate)?;
+
+    {
+        let setup = vu_common_ctrl::BounceSetup {
+            pool: &guard.pool,
+            fds: &bstate.fds,
+        };
+        vu.lock()
+            .unwrap()
+            .setup_vhost_user(
+                &mem_ref,
+                queues,
+                interrupt_cb.as_ref(),
+                acked_features,
+                backend_req_handler,
+                inflight,
+                vring_bases,
+                Some(&setup),
+            )
+            .map_err(ActivateError::VhostUserSetup)?;
+    }
+    drop(guard);
+
+    let worker_queues = queues
+        .iter()
+        .map(|(i, q, e)| (*i, vm_virtio::clone_queue(q), e.try_clone().unwrap()))
+        .collect::<Vec<_>>();
+    let fds = bstate
+        .fds
+        .iter()
+        .map(|f| f.try_clone())
+        .collect::<result::Result<Vec<_>, _>>()
+        .map_err(|_| ActivateError::BadActivate)?;
+    Ok(bounce::BounceEpollHandler {
+        shared: bstate.shared.clone(),
+        guest_mem: mem.clone(),
+        queues: worker_queues,
+        fds,
+        interrupt: interrupt_cb,
+        kill_evt: bounce_kill,
+        pause_evt: bounce_pause,
+        drain_timeout: bounce::worker::BOUNCE_DRAIN_TIMEOUT,
+    })
+}
+
 impl VhostUserCommon {
     #[expect(clippy::too_many_arguments)]
     pub fn activate<T: VhostUserFrontendReqHandler>(
@@ -490,7 +579,9 @@ impl VhostUserCommon {
         backend_req_handler: Option<FrontendReqHandler<T>>,
         kill_evt: EventFd,
         pause_evt: EventFd,
-    ) -> result::Result<VhostUserEpollHandler<T>, ActivateError> {
+        bounce_evts: Option<(EventFd, EventFd)>,
+    ) -> result::Result<(VhostUserEpollHandler<T>, Option<bounce::BounceEpollHandler>), ActivateError>
+    {
         self.guest_memory = Some(mem.clone());
 
         if self.disconnected.load(Ordering::Relaxed) {
@@ -519,21 +610,41 @@ impl VhostUserCommon {
             .map(|(i, q, e)| (*i, vm_virtio::clone_queue(q), e.try_clone().unwrap()))
             .collect::<Vec<_>>();
         let vring_bases = self.vring_bases.take();
-        vu.lock()
-            .unwrap()
-            .setup_vhost_user(
-                &mem.memory(),
+
+        let bounce_handler = if let Some(bstate) = self.bounce.as_ref() {
+            let (bounce_kill, bounce_pause) = bounce_evts.ok_or(ActivateError::BadActivate)?;
+            let handler = setup_bounce_session(
+                bstate,
+                vu,
+                &mem,
                 &queues,
-                interrupt_cb.as_ref(),
+                interrupt_cb.clone(),
                 acked_features,
                 &backend_req_handler,
                 inflight.as_mut(),
                 vring_bases.as_deref(),
-                None,
-            )
-            .map_err(ActivateError::VhostUserSetup)?;
+                bounce_kill,
+                bounce_pause,
+            )?;
+            Some(handler)
+        } else {
+            vu.lock()
+                .unwrap()
+                .setup_vhost_user(
+                    &mem.memory(),
+                    &queues,
+                    interrupt_cb.as_ref(),
+                    acked_features,
+                    &backend_req_handler,
+                    inflight.as_mut(),
+                    vring_bases.as_deref(),
+                    None,
+                )
+                .map_err(ActivateError::VhostUserSetup)?;
+            None
+        };
 
-        Ok(VhostUserEpollHandler {
+        let handler = VhostUserEpollHandler {
             vu: vu.clone(),
             mem,
             kill_evt,
@@ -547,7 +658,8 @@ impl VhostUserCommon {
             backend_req_handler,
             inflight,
             disconnected: self.disconnected.clone(),
-        })
+        };
+        Ok((handler, bounce_handler))
     }
 
     /// Like `VirtioCommon::spawn_worker`, but on failure also runs
@@ -783,6 +895,18 @@ impl VhostUserCommon {
     where
         T: Serialize,
     {
+        // The bounce pool holds request data that is not part of the
+        // serialized state, so a snapshot taken while the backend still
+        // owns requests would lose it. Pause drains the in-flight set, so
+        // a nonzero count here means the drain timed out.
+        if let Some(bounce) = &self.bounce
+            && bounce.inflight_total.load(Ordering::Relaxed) != 0
+        {
+            return Err(MigratableError::Snapshot(anyhow!(
+                "cannot snapshot vhost-user bounce device with requests still in flight"
+            )));
+        }
+
         let snapshot = Snapshot::new_from_state(state)?;
 
         if self.migration_started {
@@ -797,6 +921,13 @@ impl VhostUserCommon {
     }
 
     pub fn start_dirty_log(&mut self) -> result::Result<(), MigratableError> {
+        if self.bounce.is_some() {
+            // The backend only ever sees the pool, so its dirty log covers
+            // the pool, not guest RAM. Live migration is unsupported here.
+            return Err(MigratableError::StartDirtyLog(anyhow!(
+                "dirty logging is not supported with vhost-user bounce buffers"
+            )));
+        }
         if let Some(vu) = &self.vu {
             if let Some(guest_memory) = &self.guest_memory {
                 let last_ram_addr = guest_memory.memory().last_addr().raw_value();
@@ -893,7 +1024,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 15"]
     fn start_dirty_log_rejected_with_bounce() {
         let mut common = bounce_common();
         // Bounce devices cannot support the backend dirty log, so live
@@ -905,7 +1035,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 15"]
     fn snapshot_rejected_with_nonzero_inflight() {
         let mut common = bounce_common();
         let state: VhostUserState<()> = VhostUserState::default();

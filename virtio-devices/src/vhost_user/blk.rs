@@ -280,7 +280,7 @@ impl VirtioDevice for Blk {
         // the backend.
         let (kill_evt, pause_evt) = self.vu_common.virtio_common.dup_eventfds()?;
 
-        let mut handler = self.vu_common.activate(
+        let (mut handler, _bounce_handler) = self.vu_common.activate(
             mem,
             &queues,
             interrupt_cb.clone(),
@@ -288,6 +288,7 @@ impl VirtioDevice for Blk {
             backend_req_handler,
             kill_evt,
             pause_evt,
+            None,
         )?;
 
         let paused = self.vu_common.virtio_common.paused.clone();

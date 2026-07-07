@@ -111,6 +111,20 @@ impl BounceQueueFds {
             shadow_call: EventFd::new(libc::EFD_NONBLOCK).map_err(BounceError::CreateEventFd)?,
         })
     }
+
+    /// Duplicate both eventfds (they refer to the same kernel objects).
+    pub fn try_clone(&self) -> Result<Self, BounceError> {
+        Ok(BounceQueueFds {
+            shadow_kick: self
+                .shadow_kick
+                .try_clone()
+                .map_err(BounceError::CreateEventFd)?,
+            shadow_call: self
+                .shadow_call
+                .try_clone()
+                .map_err(BounceError::CreateEventFd)?,
+        })
+    }
 }
 
 /// Errors from the bounce buffer pool machinery.
