@@ -20,9 +20,6 @@ pub struct BounceAllocator {
     capacity: u64,
     /// Free extents as (offset, len), sorted by offset, never empty
     /// ranges, never adjacent (adjacent extents are coalesced on free).
-    // TODO: expect(dead_code) is removed when the next commit implements
-    // alloc()/free() (docs/vhost-user-bounce-plan.md commit 2).
-    #[expect(dead_code)]
     free_list: Vec<(u64, u64)>,
     /// Total free bytes, always the sum of `free_list` lengths.
     free_bytes: u64,
@@ -44,8 +41,20 @@ impl BounceAllocator {
     /// return the extent's offset, or `None` if no free extent is large
     /// enough. Zero-length allocations are rejected: callers special-case
     /// zero-length descriptors and never reach the allocator.
-    pub fn alloc(&mut self, _len: u64) -> Option<u64> {
-        todo!("implemented in docs/vhost-user-bounce-plan.md commit 2")
+    pub fn alloc(&mut self, len: u64) -> Option<u64> {
+        if len == 0 {
+            return None;
+        }
+        let len = len.next_multiple_of(BOUNCE_ALLOC_ALIGN);
+        let pos = self.free_list.iter().position(|(_, flen)| *flen >= len)?;
+        let (offset, flen) = self.free_list[pos];
+        if flen == len {
+            self.free_list.remove(pos);
+        } else {
+            self.free_list[pos] = (offset + len, flen - len);
+        }
+        self.free_bytes -= len;
+        Some(offset)
     }
 
     /// Free the extent previously returned by [`Self::alloc`] for the
@@ -53,8 +62,53 @@ impl BounceAllocator {
     ///
     /// Extents that are out of bounds or overlap free space are rejected
     /// with [`BounceError::InvalidFree`].
-    pub fn free(&mut self, _offset: u64, _len: u64) -> Result<(), BounceError> {
-        todo!("implemented in docs/vhost-user-bounce-plan.md commit 2")
+    pub fn free(&mut self, offset: u64, len: u64) -> Result<(), BounceError> {
+        let invalid = || BounceError::InvalidFree { offset, len };
+        if len == 0 {
+            return Err(invalid());
+        }
+        let rounded = len.next_multiple_of(BOUNCE_ALLOC_ALIGN);
+        let end = offset.checked_add(rounded).ok_or_else(invalid)?;
+        if !offset.is_multiple_of(BOUNCE_ALLOC_ALIGN) || end > self.capacity {
+            return Err(invalid());
+        }
+        // Find the insertion point in the offset-sorted free list and
+        // reject any overlap with existing free extents.
+        let pos = self.free_list.partition_point(|(foff, _)| *foff < offset);
+        if let Some((prev_off, prev_len)) = pos.checked_sub(1).map(|p| self.free_list[p])
+            && prev_off + prev_len > offset
+        {
+            return Err(invalid());
+        }
+        if let Some((next_off, _)) = self.free_list.get(pos)
+            && end > *next_off
+        {
+            return Err(invalid());
+        }
+
+        // Insert and coalesce with adjacent neighbors.
+        let merge_prev = pos
+            .checked_sub(1)
+            .is_some_and(|p| self.free_list[p].0 + self.free_list[p].1 == offset);
+        let merge_next = self
+            .free_list
+            .get(pos)
+            .is_some_and(|(noff, _)| *noff == end);
+        match (merge_prev, merge_next) {
+            (true, true) => {
+                let next_len = self.free_list[pos].1;
+                self.free_list[pos - 1].1 += rounded + next_len;
+                self.free_list.remove(pos);
+            }
+            (true, false) => self.free_list[pos - 1].1 += rounded,
+            (false, true) => {
+                self.free_list[pos].0 = offset;
+                self.free_list[pos].1 += rounded;
+            }
+            (false, false) => self.free_list.insert(pos, (offset, rounded)),
+        }
+        self.free_bytes += rounded;
+        Ok(())
     }
 
     /// Total bytes currently free (not necessarily contiguous).
@@ -73,7 +127,6 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 2"]
     fn alloc_returns_aligned_offset_within_capacity() {
         let mut a = BounceAllocator::new(1024);
         let off = a.alloc(100).unwrap();
@@ -82,7 +135,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 2"]
     fn alloc_zero_len_rejected() {
         let mut a = BounceAllocator::new(1024);
         assert_eq!(a.alloc(0), None);
@@ -90,7 +142,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 2"]
     fn alloc_rounds_len_up_to_alignment() {
         let mut a = BounceAllocator::new(1024);
         let _ = a.alloc(1).unwrap();
@@ -98,7 +149,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 2"]
     fn alloc_exhaustion_returns_none_without_side_effects() {
         let mut a = BounceAllocator::new(256);
         let off = a.alloc(200).unwrap(); // rounds to 256, takes everything
@@ -110,7 +160,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 2"]
     fn free_then_alloc_reuses_space() {
         let mut a = BounceAllocator::new(1024);
         let x = a.alloc(128).unwrap();
@@ -120,7 +169,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 2"]
     fn free_coalesces_with_previous_and_next() {
         let mut a = BounceAllocator::new(768);
         let x = a.alloc(256).unwrap();
@@ -137,7 +185,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 2"]
     fn alloc_first_fit_is_deterministic() {
         let mut a = BounceAllocator::new(1024);
         let _a0 = a.alloc(256).unwrap(); // @0
@@ -154,7 +201,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 2"]
     fn free_bytes_accounting_over_interleaved_ops() {
         let mut a = BounceAllocator::new(64 * 1024);
         let mut live: Vec<(u64, u64)> = Vec::new();
@@ -185,7 +231,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 2"]
     fn invalid_free_unallocated_range_rejected() {
         let mut a = BounceAllocator::new(1024);
         // Nothing was ever allocated: the range is free, so freeing it
@@ -202,7 +247,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 2"]
     fn invalid_free_overlapping_free_range_rejected() {
         let mut a = BounceAllocator::new(1024);
         let x = a.alloc(128).unwrap();
@@ -216,7 +260,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 2"]
     fn full_drain_restores_initial_state() {
         let mut a = BounceAllocator::new(4096);
         let mut extents = Vec::new();
