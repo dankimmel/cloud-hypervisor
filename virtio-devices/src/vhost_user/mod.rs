@@ -471,6 +471,8 @@ pub struct VhostUserCommon {
     pub migration_started: bool,
     pub server: bool,
     pub vring_bases: Option<Vec<u64>>,
+    /// Bounce buffer pool state when the device runs in bounce mode.
+    pub bounce: Option<bounce::BounceState>,
     /// Indicates that the backend is no longer reachable. Shared with EPollHandler.
     pub disconnected: Arc<AtomicBool>,
     saved_dirty_log: Option<MemoryRangeTable>,
@@ -872,5 +874,56 @@ impl VhostUserCommon {
         self.vu = None;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::Ordering;
+
+    use super::bounce::{BounceConfig, BounceState};
+    use super::*;
+
+    fn bounce_common() -> VhostUserCommon {
+        VhostUserCommon {
+            bounce: Some(BounceState::new(&BounceConfig::default(), 1, 128).unwrap()),
+            vu_num_queues: 1,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 15"]
+    fn start_dirty_log_rejected_with_bounce() {
+        let mut common = bounce_common();
+        // Bounce devices cannot support the backend dirty log, so live
+        // migration must be refused rather than silently losing writes.
+        assert!(matches!(
+            common.start_dirty_log(),
+            Err(MigratableError::StartDirtyLog(_))
+        ));
+    }
+
+    #[test]
+    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 15"]
+    fn snapshot_rejected_with_nonzero_inflight() {
+        let mut common = bounce_common();
+        let state: VhostUserState<()> = VhostUserState::default();
+
+        // With nothing in flight the snapshot proceeds.
+        common.snapshot(&state).unwrap();
+
+        // A request still owned by the backend means the pool holds data
+        // the snapshot would not capture, so it must be refused.
+        common
+            .bounce
+            .as_ref()
+            .unwrap()
+            .inflight_total
+            .store(1, Ordering::Relaxed);
+        assert!(matches!(
+            common.snapshot(&state),
+            Err(MigratableError::Snapshot(_))
+        ));
     }
 }
