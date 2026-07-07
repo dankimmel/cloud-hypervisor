@@ -374,6 +374,15 @@ pub enum ValidationError {
     /// Rate limiting is not supported with vhost-user
     #[error("Rate limiting is not supported with vhost-user")]
     VhostUserRateLimiterNotSupported,
+    /// A bounce buffer pool was requested without vhost-user
+    #[error("Bounce buffer pool (bounce=on) requires vhost_user=on")]
+    BounceRequiresVhostUser,
+    /// Bounce buffer pool is not yet supported together with a vIOMMU
+    #[error("Bounce buffer pool (bounce=on) is not supported with iommu=on")]
+    BounceIommuNotSupported,
+    /// bounce_pool_size was given without enabling the bounce pool
+    #[error("bounce_pool_size requires bounce=on")]
+    BouncePoolSizeRequiresBounce,
     /// The specified I/O port was invalid. It should be provided in hex, such as `0xe9`.
     #[cfg(target_arch = "x86_64")]
     #[error("The IO port was not properly provided in hex or a `0x` prefix is missing: {0}")]
@@ -1430,6 +1439,7 @@ impl DiskConfig {
          \"path=<disk_image_path>,readonly=on|off,direct=on|off,iommu=on|off,\
          num_queues=<number_of_queues>,queue_size=<size_of_each_queue>,\
          vhost_user=on|off,socket=<vhost_user_socket_path>,\
+         bounce=on|off,bounce_pool_size=<bytes>,\
          bw_size=<bytes>,bw_one_time_burst=<bytes>,bw_refill_time=<ms>,\
          ops_size=<io_ops>,ops_one_time_burst=<io_ops>,ops_refill_time=<ms>,\
          id=<device_id>,pci_segment=<segment_id>,pci_device_id=<pci_slot>,\
@@ -1448,6 +1458,8 @@ impl DiskConfig {
             .add("num_queues")
             .add("vhost_user")
             .add("socket")
+            .add("bounce")
+            .add("bounce_pool_size")
             .add("bw_size")
             .add("bw_one_time_burst")
             .add("bw_refill_time")
@@ -1492,6 +1504,15 @@ impl DiskConfig {
             .unwrap_or(Toggle(false))
             .0;
         let vhost_socket = parser.get("socket");
+        let bounce = parser
+            .convert::<Toggle>("bounce")
+            .map_err(Error::ParseDisk)?
+            .unwrap_or(Toggle(false))
+            .0;
+        let bounce_pool_size = parser
+            .convert::<ByteSized>("bounce_pool_size")
+            .map_err(Error::ParseDisk)?
+            .map(|b| b.0);
         let disable_io_uring = parser
             .convert::<Toggle>("_disable_io_uring")
             .map_err(Error::ParseDisk)?
@@ -1603,6 +1624,8 @@ impl DiskConfig {
             queue_size,
             vhost_user,
             vhost_socket,
+            bounce,
+            bounce_pool_size,
             rate_limit_group,
             rate_limiter_config,
             disable_io_uring,
@@ -1630,6 +1653,20 @@ impl DiskConfig {
 
         if self.queue_size <= MINIMUM_BLOCK_QUEUE_SIZE {
             return Err(ValidationError::BlockQueueSizeTooSmall(self.queue_size));
+        }
+
+        // Bounce checks precede the generic vhost-user/iommu rejection so
+        // a bounce device produces the clearer bounce-specific error.
+        if self.bounce && !self.vhost_user {
+            return Err(ValidationError::BounceRequiresVhostUser);
+        }
+
+        if self.bounce && self.pci_common.iommu {
+            return Err(ValidationError::BounceIommuNotSupported);
+        }
+
+        if self.bounce_pool_size.is_some() && !self.bounce {
+            return Err(ValidationError::BouncePoolSizeRequiresBounce);
         }
 
         if self.vhost_user && self.pci_common.iommu {
@@ -4218,6 +4255,8 @@ mod unit_tests {
             queue_size: 128,
             vhost_user: false,
             vhost_socket: None,
+            bounce: false,
+            bounce_pool_size: None,
             disable_io_uring: false,
             disable_aio: false,
             rate_limit_group: None,
@@ -4229,6 +4268,58 @@ mod unit_tests {
             image_type: ImageType::Unknown,
             lock_granularity: LockGranularityChoice::default(),
         }
+    }
+
+    #[test]
+    fn test_disk_bounce_parsing() -> Result<()> {
+        // Defaults to off.
+        assert!(!DiskConfig::parse("path=/path/to_file")?.bounce);
+        assert_eq!(
+            DiskConfig::parse("path=/path/to_file")?.bounce_pool_size,
+            None
+        );
+
+        // bounce=on with a vhost-user device.
+        let cfg = DiskConfig::parse("vhost_user=on,socket=/tmp/sock,bounce=on")?;
+        assert!(cfg.bounce);
+        assert_eq!(cfg.bounce_pool_size, None);
+
+        // bounce_pool_size accepts human sizes.
+        let cfg =
+            DiskConfig::parse("vhost_user=on,socket=/tmp/sock,bounce=on,bounce_pool_size=16M")?;
+        assert_eq!(cfg.bounce_pool_size, Some(16 << 20));
+        Ok(())
+    }
+
+    #[test]
+    fn test_disk_bounce_validation() {
+        let vm_config = valid_vm_config();
+
+        // bounce=on requires vhost_user=on.
+        let disk = DiskConfig::parse("path=/path,bounce=on").unwrap();
+        assert!(matches!(
+            disk.validate(&vm_config),
+            Err(ValidationError::BounceRequiresVhostUser)
+        ));
+
+        // bounce=on is rejected together with iommu=on.
+        let disk = DiskConfig::parse("vhost_user=on,socket=/s,bounce=on,iommu=on").unwrap();
+        assert!(matches!(
+            disk.validate(&vm_config),
+            Err(ValidationError::BounceIommuNotSupported)
+        ));
+
+        // bounce_pool_size requires bounce=on.
+        let disk = DiskConfig::parse("vhost_user=on,socket=/s,bounce_pool_size=8M").unwrap();
+        assert!(matches!(
+            disk.validate(&vm_config),
+            Err(ValidationError::BouncePoolSizeRequiresBounce)
+        ));
+
+        // A valid bounce disk passes.
+        let disk =
+            DiskConfig::parse("vhost_user=on,socket=/s,bounce=on,bounce_pool_size=8M").unwrap();
+        disk.validate(&vm_config).unwrap();
     }
 
     #[test]
@@ -5352,9 +5443,8 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         }
     }
 
-    #[test]
-    fn test_config_validation() {
-        let mut valid_config = VmConfig {
+    fn valid_vm_config() -> VmConfig {
+        VmConfig {
             cpus: CpusConfig {
                 boot_vcpus: 1,
                 max_vcpus: 1,
@@ -5437,7 +5527,12 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             landlock_rules: None,
             #[cfg(feature = "ivshmem")]
             ivshmem: None,
-        };
+        }
+    }
+
+    #[test]
+    fn test_config_validation() {
+        let mut valid_config = valid_vm_config();
 
         valid_config.validate().unwrap();
 

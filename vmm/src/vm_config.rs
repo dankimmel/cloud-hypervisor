@@ -394,6 +394,14 @@ pub struct DiskConfig {
     #[serde(default)]
     pub vhost_user: bool,
     pub vhost_socket: Option<String>,
+    /// Route this vhost-user device's I/O through a VMM-managed bounce
+    /// buffer pool instead of sharing guest RAM with the backend.
+    #[serde(default)]
+    pub bounce: bool,
+    /// Optional bounce pool buffer-arena size in bytes (default sizing
+    /// when unset). Only meaningful with `bounce=on`.
+    #[serde(default)]
+    pub bounce_pool_size: Option<u64>,
     #[serde(default)]
     pub rate_limit_group: Option<String>,
     #[serde(default)]
