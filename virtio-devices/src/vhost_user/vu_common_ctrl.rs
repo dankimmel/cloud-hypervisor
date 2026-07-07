@@ -3,7 +3,7 @@
 
 use std::fs::File;
 use std::io::{Read, Write};
-use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -29,6 +29,7 @@ use vmm_sys_util::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::timerfd::TimerFd;
 
+use super::bounce::pool::memfd_create;
 use super::{Error, Result, VhostUserState};
 use crate::vhost_user::Inflight;
 use crate::{
@@ -754,16 +755,5 @@ impl VhostUserHandle {
         } else {
             Err(Error::MissingShmLogRegion)
         }
-    }
-}
-
-fn memfd_create(name: &ffi::CStr, flags: u32) -> io::Result<RawFd> {
-    // SAFETY: FFI call with valid arguments
-    let res = unsafe { libc::syscall(libc::SYS_memfd_create, name.as_ptr(), flags) };
-
-    if res < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(res as RawFd)
     }
 }

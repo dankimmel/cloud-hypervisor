@@ -515,8 +515,10 @@ impl BouncePool {
 - `layout_ring_blocks_are_page_aligned_and_disjoint` (for nq=3, qs=256:
   every desc/avail/used range disjoint, desc 16-aligned, avail 2-aligned,
   used 4-aligned, arena starts page-aligned after last ring)
-- `layout_ring_sizes_match_virtio_spec` (desc = 16·qs, avail = 6+2·qs,
-  used = 6+8·qs)
+- `layout_ring_sizes_match_virtio_spec` (desc = 16·qs, avail = 6+2·qs+2,
+  used = 6+8·qs+2 — the trailing event-idx fields are reserved
+  unconditionally so the layout stays feature-independent and commit 29
+  needs no layout change)
 - `new_pool_memory_is_zeroed`
 - `pool_mem_is_single_region_at_gpa_zero_with_fd`
 - `alloc_returns_gpa_inside_arena`
