@@ -22,7 +22,9 @@ use std::num::Wrapping;
 use std::sync::atomic::Ordering;
 
 use log::error;
-use virtio_bindings::virtio_ring::{VRING_DESC_F_INDIRECT, VRING_DESC_F_NEXT, VRING_DESC_F_WRITE};
+use virtio_bindings::virtio_ring::{
+    VRING_AVAIL_F_NO_INTERRUPT, VRING_DESC_F_INDIRECT, VRING_DESC_F_NEXT, VRING_DESC_F_WRITE,
+};
 use virtio_queue::desc::split::Descriptor;
 use virtio_queue::{Queue, QueueOwnedT, QueueT};
 use vm_memory::{Address, Bytes, GuestAddress, GuestMemory, GuestMemoryError};
@@ -67,9 +69,6 @@ pub struct CompleteOutcome {
 }
 
 /// One captured guest buffer segment of an in-flight chain.
-// TODO: expect(dead_code) is removed as plan commits 6-7 implement
-// mirror_avail/complete_used (docs/vhost-user-bounce-plan.md).
-#[expect(dead_code)]
 struct Segment {
     guest_addr: GuestAddress,
     pool_addr: GuestAddress,
@@ -78,9 +77,6 @@ struct Segment {
 }
 
 /// A chain currently owned by the backend.
-// TODO: expect(dead_code) is removed as plan commits 6-7 implement
-// mirror_avail/complete_used (docs/vhost-user-bounce-plan.md).
-#[expect(dead_code)]
 struct InflightChain {
     guest_head: u16,
     segments: Vec<Segment>,
@@ -412,11 +408,123 @@ impl ShadowQueue {
     /// guest used entries.
     pub fn complete_used(
         &mut self,
-        _guest_mem: &GuestMemoryMmap,
-        _guest_q: &mut Queue,
-        _pool: &mut BouncePool,
+        guest_mem: &GuestMemoryMmap,
+        guest_q: &mut Queue,
+        pool: &mut BouncePool,
     ) -> CompleteOutcome {
-        todo!("implemented in docs/vhost-user-bounce-plan.md commit 7")
+        let mut out = CompleteOutcome::default();
+        if self.broken {
+            return out;
+        }
+
+        let idx_addr = GuestAddress(self.ring.used + 2);
+        let Ok(shadow_used_idx) = pool.mem().load::<u16>(idx_addr, Ordering::Acquire) else {
+            self.mark_broken("shadow used index load failed");
+            return out;
+        };
+
+        while self.next_used != Wrapping(shadow_used_idx) {
+            let pos = self.next_used.0 % self.size;
+            let elem_addr = self.ring.used + 4 + u64::from(pos) * 8;
+            let (Ok(id), Ok(len)) = (
+                pool.mem().read_obj::<u32>(GuestAddress(elem_addr)),
+                pool.mem().read_obj::<u32>(GuestAddress(elem_addr + 4)),
+            ) else {
+                self.mark_broken("shadow used element read failed");
+                break;
+            };
+
+            // Translate the shadow head back to the captured chain.
+            let chain = if id < u32::from(self.size) {
+                self.inflight[id as usize].take()
+            } else {
+                None
+            };
+            let Some(chain) = chain else {
+                self.mark_broken("backend completed an unknown or stale used id");
+                break;
+            };
+            self.inflight_count -= 1;
+
+            // Never trust the backend's written length beyond the
+            // chain's device-writable capacity.
+            let writable_total: u64 = chain
+                .segments
+                .iter()
+                .filter(|s| s.writable)
+                .map(|s| u64::from(s.len))
+                .sum();
+            let len = u64::from(len).min(writable_total) as u32;
+
+            // Copy device-written data back to the captured guest
+            // addresses, walking writable segments in chain order.
+            let mut remaining = len;
+            let mut copy_failed = false;
+            for seg in chain.segments.iter().filter(|s| s.writable) {
+                if remaining == 0 {
+                    break;
+                }
+                let n = remaining.min(seg.len);
+                if n == 0 {
+                    continue;
+                }
+                if let Err(e) = self.copy_chunked(
+                    |buf, offset| {
+                        pool.mem()
+                            .read_slice(buf, seg.pool_addr.unchecked_add(offset))
+                    },
+                    |buf, offset| guest_mem.write_slice(buf, seg.guest_addr.unchecked_add(offset)),
+                    n,
+                ) {
+                    self.mark_broken(&format!("guest buffer write-back failed: {e}"));
+                    copy_failed = true;
+                    break;
+                }
+                remaining -= n;
+            }
+            self.release_chain(pool, &chain);
+            if copy_failed {
+                break;
+            }
+
+            if guest_q.add_used(guest_mem, chain.guest_head, len).is_err() {
+                self.mark_broken("guest used ring publish failed");
+                break;
+            }
+            out.chains += 1;
+            self.next_used += 1;
+        }
+
+        if out.chains > 0 {
+            out.needs_interrupt = self.guest_needs_interrupt(guest_mem, guest_q);
+        }
+        out
+    }
+
+    /// Free a completed (or aborted) chain's pool extents and recycle
+    /// its shadow descriptor slots.
+    fn release_chain(&mut self, pool: &mut BouncePool, chain: &InflightChain) {
+        for seg in &chain.segments {
+            if seg.len != 0 {
+                // Freeing a captured extent cannot fail.
+                let res = pool.free(seg.pool_addr, u64::from(seg.len));
+                debug_assert!(res.is_ok());
+            }
+        }
+        self.free_slots.extend_from_slice(&chain.slots);
+    }
+
+    /// Whether the guest wants an interrupt for freshly published used
+    /// entries. `needs_notification` provides the ordering fence and the
+    /// EVENT_IDX logic when that feature is enabled; without it the
+    /// advisory VRING_AVAIL_F_NO_INTERRUPT flag is honored directly
+    /// (virtio-queue does not implement it).
+    fn guest_needs_interrupt(&mut self, guest_mem: &GuestMemoryMmap, guest_q: &mut Queue) -> bool {
+        let base = guest_q.needs_notification(guest_mem).unwrap_or(true);
+        let flags: u16 = guest_mem
+            .load(GuestAddress(guest_q.avail_ring()), Ordering::Relaxed)
+            .unwrap_or(0);
+        base && (flags & VRING_AVAIL_F_NO_INTERRUPT as u16) == 0
     }
 
     /// Chains currently owned by the backend.
@@ -835,7 +943,6 @@ mod tests {
     // ---- Completion (unignored in plan commit 7) ----
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 7"]
     fn complete_copies_back_writable_data_and_publishes_guest_used() {
         let mut h = harness(8, 8192);
         let (req, resp) = (h.ring.alloc_buf(64), h.ring.alloc_buf(256));
@@ -855,7 +962,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 7"]
     fn complete_respects_daemon_len_cap() {
         let mut h = harness(8, 8192);
         let resp = h.ring.alloc_buf(256);
@@ -880,7 +986,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 7"]
     fn complete_caps_len_at_writable_total() {
         let mut h = harness(8, 8192);
         let (req, resp) = (h.ring.alloc_buf(64), h.ring.alloc_buf(128));
@@ -896,7 +1001,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 7"]
     fn complete_readonly_chain_copies_nothing() {
         let mut h = harness(8, 8192);
         let req = h.ring.alloc_buf(64);
@@ -912,7 +1016,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 7"]
     fn complete_frees_and_scrubs_extents_and_recycles_slots() {
         let mut h = harness(2, 8192);
         let resp = h.ring.alloc_buf(128);
@@ -945,7 +1048,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 7"]
     fn complete_out_of_order_completions() {
         let mut h = harness(8, 8192);
         let mut heads = Vec::new();
@@ -973,7 +1075,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 7"]
     fn complete_multiple_in_one_call() {
         let mut h = harness(8, 8192);
         for _ in 0..3 {
@@ -991,7 +1092,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 7"]
     fn complete_idle_when_no_new_used() {
         let mut h = harness(8, 8192);
         assert_eq!(
@@ -1004,7 +1104,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 7"]
     fn mirror_and_complete_wrap_indices() {
         let mut h = harness(4, 8192);
         // Drive enough traffic through a tiny queue to wrap the ring
@@ -1024,7 +1123,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 7"]
     fn complete_unknown_id_marks_queue_broken() {
         let mut h = harness(8, 8192);
         h.daemon.complete(&h.pool, 0, 3, 0);
@@ -1034,7 +1132,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 7"]
     fn complete_stale_duplicate_id_marks_queue_broken() {
         let mut h = harness(8, 8192);
         let buf = h.ring.alloc_buf(64);
@@ -1051,7 +1148,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 7"]
     fn complete_honors_guest_no_interrupt_flag() {
         let mut h = harness(8, 8192);
         h.ring
@@ -1076,7 +1172,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 7"]
     fn complete_uses_captured_segments_not_live_desc_table() {
         let mut h = harness(8, 8192);
         let (buf1, buf2) = (h.ring.alloc_buf(64), h.ring.alloc_buf(64));
@@ -1096,7 +1191,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 7"]
     fn broken_queue_complete_is_idle() {
         let mut h = harness(8, 8192);
         h.daemon.complete(&h.pool, 0, 5, 0);
