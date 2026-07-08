@@ -333,20 +333,33 @@ impl ShadowQueue {
                     }
                 };
 
-            // Walk the chain. The iterator stops silently on loops,
-            // overlong chains and unreadable descriptor tables; in all
-            // those cases the last yielded descriptor still claims a
-            // successor, which is how they are told apart from a clean
-            // end of chain. Nested indirect tables yield nothing.
+            // Walk the chain into `descs`. Under a vIOMMU an indirect head
+            // needs a translated walk: virtio-queue's iterator would read
+            // the indirect table through the raw (untranslated) pointer, so
+            // do it ourselves. All other cases use virtio-queue's flatten,
+            // which stops silently on loops, overlong chains and unreadable
+            // descriptor tables; in those cases the last yielded descriptor
+            // still claims a successor, telling them apart from a clean end
+            // of chain. Nested indirect tables yield nothing.
             let mut descs: Vec<Descriptor> = Vec::new();
-            let mut open_ended = false;
-            for desc in chain {
-                open_ended = desc.has_next();
-                descs.push(desc);
-            }
-            if descs.is_empty() || open_ended {
-                self.mark_broken("malformed descriptor chain");
-                break 'chains;
+            if head_is_indirect && self.access_platform.is_some() {
+                match self.read_translated_indirect(guest_mem, guest_q.desc_table(), guest_head) {
+                    Ok(d) => descs = d,
+                    Err(msg) => {
+                        self.mark_broken(msg);
+                        break 'chains;
+                    }
+                }
+            } else {
+                let mut open_ended = false;
+                for desc in chain {
+                    open_ended = desc.has_next();
+                    descs.push(desc);
+                }
+                if descs.is_empty() || open_ended {
+                    self.mark_broken("malformed descriptor chain");
+                    break 'chains;
+                }
             }
             // A chain (including a flattened indirect table) may never be
             // longer than the queue.
@@ -553,6 +566,61 @@ impl ShadowQueue {
             self.arm_backend_calls(pool);
         }
         out
+    }
+
+    /// Read and flatten an indirect table that lives behind an IOVA,
+    /// returning its descriptor chain. Used instead of virtio-queue's own
+    /// flatten when a vIOMMU is installed, since that iterator reads the
+    /// table through the untranslated head pointer. The table pointer is
+    /// translated here (to locate the table); the returned descriptors'
+    /// buffer addresses remain IOVAs, translated later per descriptor.
+    fn read_translated_indirect(
+        &self,
+        guest_mem: &GuestMemoryMmap,
+        desc_table: u64,
+        head: u16,
+    ) -> Result<Vec<Descriptor>, &'static str> {
+        let head_desc = guest_mem
+            .read_obj::<Descriptor>(GuestAddress(desc_table + u64::from(head) * 16))
+            .map_err(|_| "indirect head descriptor unreadable")?;
+        let table_len = head_desc.len();
+        if table_len == 0 || table_len % 16 != 0 {
+            return Err("indirect table length invalid");
+        }
+        let entries = table_len / 16;
+        let table_gpa = self
+            .translate(head_desc.addr(), table_len)
+            .map_err(|()| "indirect table pointer translation failed")?;
+        if !guest_mem.check_range(table_gpa, table_len as usize) {
+            return Err("indirect table outside guest memory");
+        }
+
+        // Walk the table from index 0 following `next`, bounded by the
+        // entry count to reject cycles, and reject nested indirect tables.
+        let mut descs = Vec::new();
+        let mut index: u32 = 0;
+        loop {
+            if index >= entries {
+                return Err("indirect descriptor index out of range");
+            }
+            let d = guest_mem
+                .read_obj::<Descriptor>(table_gpa.unchecked_add(u64::from(index) * 16))
+                .map_err(|_| "indirect table entry unreadable")?;
+            if d.refers_to_indirect_table() {
+                return Err("nested indirect descriptor");
+            }
+            let has_next = d.has_next();
+            let next = d.next();
+            descs.push(d);
+            if descs.len() > entries as usize {
+                return Err("indirect descriptor loop");
+            }
+            if !has_next {
+                break;
+            }
+            index = u32::from(next);
+        }
+        Ok(descs)
     }
 
     /// Read the raw flags of the descriptor at `head` in the guest
@@ -1326,7 +1394,6 @@ mod tests {
     // ---- Translated indirect walk (plan commit 33) ----
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 33"]
     fn indirect_table_pointer_is_translated() {
         // The head descriptor's table pointer is an IOVA outside guest RAM.
         // A correct walk must translate it to read the table at all; without
@@ -1352,7 +1419,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 33"]
     fn indirect_entry_addresses_are_translated() {
         // A two-segment indirect chain: both entry buffer addresses are
         // IOVAs and must be translated for copy-in and copy-back.
@@ -1390,7 +1456,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 33"]
     fn indirect_table_translation_failure_marks_broken() {
         let mut h = harness(8, 8192);
         h.sq.set_access_platform(Some(Arc::new(FailingTranslator)));
