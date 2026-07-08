@@ -286,6 +286,9 @@ pub struct VhostUserEpollHandler<S: VhostUserFrontendReqHandler> {
     pub inflight: Option<Inflight>,
     /// Flag set by the worker when the vhost-user backend is no longer reachable.
     pub disconnected: Arc<AtomicBool>,
+    /// Bounce pool/shadow state, so reconnect can re-establish it. Present
+    /// only for bounce-mode devices.
+    pub bounce: Option<bounce::BounceReconnect>,
 }
 
 impl<S: VhostUserFrontendReqHandler> VhostUserEpollHandler<S> {
@@ -354,10 +357,38 @@ impl<S: VhostUserFrontendReqHandler> VhostUserEpollHandler<S> {
             .iter()
             .map(|(i, q, e)| (*i, vm_virtio::clone_queue(q), e.try_clone().unwrap()))
             .collect::<Vec<_>>();
-        // Initialize the backend
-        vhost_user
-            .reinitialize_vhost_user(
-                self.mem.memory().deref(),
+        let mem = self.mem.memory();
+        // Initialize the backend. In bounce mode, quiesce the data-plane
+        // worker by holding the shared lock while rebuilding the pool
+        // shadow rings from the still-intact in-flight chains, then hand
+        // the reconnected backend the pool and shadow rings again.
+        let reinit = if let Some(br) = self.bounce.as_ref() {
+            let mut guard = br.shared.lock().unwrap();
+            let bounce::BounceShared { pool, shadow } = &mut *guard;
+            pool.zero_rings().map_err(|e| {
+                EpollHelperError::IoError(io::Error::other(format!(
+                    "failed zeroing bounce rings on reconnect: {e:?}"
+                )))
+            })?;
+            for sq in shadow.iter_mut() {
+                sq.rebuild_for_reconnect(pool, 0);
+            }
+            let bases = vec![0u64; queues.len()];
+            let setup = vu_common_ctrl::BounceSetup { pool, fds: &br.fds };
+            vhost_user.reinitialize_vhost_user(
+                mem.deref(),
+                &queues,
+                self.virtio_interrupt.as_ref(),
+                self.acked_features,
+                self.acked_protocol_features,
+                &self.backend_req_handler,
+                self.inflight.as_mut(),
+                Some(&bases),
+                Some(&setup),
+            )
+        } else {
+            vhost_user.reinitialize_vhost_user(
+                mem.deref(),
                 &queues,
                 self.virtio_interrupt.as_ref(),
                 self.acked_features,
@@ -365,12 +396,14 @@ impl<S: VhostUserFrontendReqHandler> VhostUserEpollHandler<S> {
                 &self.backend_req_handler,
                 self.inflight.as_mut(),
                 None,
+                None,
             )
-            .map_err(|e| {
-                EpollHelperError::IoError(io::Error::other(format!(
-                    "failed reconnecting vhost-user backend: {e:?}"
-                )))
-            })?;
+        };
+        reinit.map_err(|e| {
+            EpollHelperError::IoError(io::Error::other(format!(
+                "failed reconnecting vhost-user backend: {e:?}"
+            )))
+        })?;
 
         helper.add_event_custom(
             vhost_user.socket_handle().as_raw_fd(),
@@ -647,6 +680,21 @@ impl VhostUserCommon {
             None
         };
 
+        let bounce_reconnect = if let Some(bstate) = self.bounce.as_ref() {
+            let fds = bstate
+                .fds
+                .iter()
+                .map(|f| f.try_clone())
+                .collect::<result::Result<Vec<_>, _>>()
+                .map_err(|_| ActivateError::BadActivate)?;
+            Some(bounce::BounceReconnect {
+                shared: bstate.shared.clone(),
+                fds: Arc::new(fds),
+            })
+        } else {
+            None
+        };
+
         let handler = VhostUserEpollHandler {
             vu: vu.clone(),
             mem,
@@ -661,6 +709,7 @@ impl VhostUserCommon {
             backend_req_handler,
             inflight,
             disconnected: self.disconnected.clone(),
+            bounce: bounce_reconnect,
         };
         Ok((handler, bounce_handler))
     }

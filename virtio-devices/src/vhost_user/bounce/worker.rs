@@ -36,11 +36,20 @@ use crate::{
 pub const BOUNCE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Pool plus the per-queue shadow state, behind one mutex so the worker
-/// loop and (later) the reconnect path never lock them in a conflicting
-/// order.
+/// loop and the reconnect path never lock them in a conflicting order.
 pub struct BounceShared {
     pub pool: BouncePool,
     pub shadow: Vec<ShadowQueue>,
+}
+
+/// The bounce state the vhost-user reconnection thread needs to
+/// re-establish the pool and shadow rings after the backend restarts.
+/// Holding the shared lock during a rebuild quiesces the data-plane
+/// worker (it blocks on the same lock).
+#[derive(Clone)]
+pub struct BounceReconnect {
+    pub shared: Arc<Mutex<BounceShared>>,
+    pub fds: Arc<Vec<BounceQueueFds>>,
 }
 
 /// Per-device bounce data-plane worker.
@@ -589,6 +598,47 @@ mod tests {
 
         h.paused.store(false, Ordering::SeqCst);
         h.handle.as_ref().unwrap().thread().unpark();
+        h.stop();
+    }
+
+    #[test]
+    fn reconnect_rebuild_while_worker_runs_completes_once() {
+        // Exercise the reconnect coordination: with the worker thread
+        // live, take the shared lock (as the reconnection thread does),
+        // rebuild the shadow rings, release, then complete through the
+        // worker. No deadlock, and the request completes exactly once.
+        let mut h = build(1, 8, 8192);
+        h.start();
+        let resp = h.rings[0].alloc_buf(64);
+        let head = h.rings[0].chain(&h.mem, &[(resp, 64, true)]);
+        h.rings[0].publish(&h.mem, head);
+        h.kick_guest(0);
+        assert!(h.wait_backend_kick(0));
+        // Backend consumed the avail entry but has not completed it.
+        {
+            let guard = h.shared.lock().unwrap();
+            h.daemon.pop_avail(&guard.pool, 0);
+        }
+
+        // Reconnect: rebuild under the shared lock while the worker runs.
+        {
+            let mut guard = h.shared.lock().unwrap();
+            let BounceShared { pool, shadow } = &mut *guard;
+            pool.zero_rings().unwrap();
+            for sq in shadow.iter_mut() {
+                sq.rebuild_for_reconnect(pool, 0);
+            }
+        }
+        // A fresh backend session re-executes the republished chain.
+        let mut daemon = FakeDaemon::new(1, 8);
+        {
+            let guard = h.shared.lock().unwrap();
+            daemon.serve_one(&guard.pool, 0, 0x99);
+        }
+        h.signal_backend_call(0);
+        assert!(h.interrupt.wait_interrupt(0, TIMEOUT));
+        assert_eq!(read_guest(&h.mem, resp, 64), vec![0x99; 64]);
+        assert_eq!(h.rings[0].used_idx(&h.mem), 1);
         h.stop();
     }
 

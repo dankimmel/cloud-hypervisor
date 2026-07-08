@@ -84,9 +84,6 @@ struct InflightChain {
     slots: Vec<u16>,
     /// Monotonic submission order, used to re-publish chains in their
     /// original order after a backend reconnect.
-    // TODO: expect(dead_code) is removed when the next commit implements
-    // rebuild_for_reconnect (docs/vhost-user-bounce-plan.md commit 25).
-    #[expect(dead_code)]
     seq: u64,
 }
 
@@ -187,8 +184,45 @@ impl ShadowQueue {
     /// them as avail entries, in original submission order, starting at
     /// `new_base`. The caller must have zeroed the shadow rings first.
     /// Returns the new shadow avail index the backend should be given.
-    pub fn rebuild_for_reconnect(&mut self, _pool: &mut BouncePool, _new_base: u16) -> u16 {
-        todo!("implemented in docs/vhost-user-bounce-plan.md commit 25")
+    pub fn rebuild_for_reconnect(&mut self, pool: &mut BouncePool, new_base: u16) -> u16 {
+        // In-flight chains in original submission order.
+        let mut order: Vec<(u64, usize)> = self
+            .inflight
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, c)| c.as_ref().map(|c| (c.seq, slot)))
+            .collect();
+        order.sort_unstable_by_key(|(seq, _)| *seq);
+
+        let mut idx = Wrapping(new_base);
+        for (_, slot) in &order {
+            let chain = self.inflight[*slot].as_ref().unwrap();
+            let specs: Vec<(GuestAddress, u32, bool)> = chain
+                .segments
+                .iter()
+                .map(|s| (s.pool_addr, s.len, s.writable))
+                .collect();
+            // Re-write the shadow descriptors (the pool extents still hold
+            // this chain's data) and re-publish the avail entry. Pool
+            // writes cannot fail for a valid pool.
+            let ok = write_shadow_chain(pool, &self.ring, &chain.slots, &specs);
+            debug_assert!(ok);
+            let pos = idx.0 % self.size;
+            let entry = GuestAddress(self.ring.avail + 4 + u64::from(pos) * 2);
+            let _ = pool.mem().write_obj(chain.slots[0], entry);
+            idx += 1;
+        }
+
+        // Publish the rebuilt shadow avail index; the backend resumes from
+        // `new_base` (given to it via SET_VRING_BASE), so used entries are
+        // consumed from there too.
+        let idx_addr = GuestAddress(self.ring.avail + 2);
+        let _ = pool.mem().store(idx.0, idx_addr, Ordering::Release);
+        self.shadow_avail_idx = idx;
+        self.next_used = Wrapping(new_base);
+        self.broken = false;
+        self.stalled = false;
+        idx.0
     }
 
     /// Translate new guest avail entries into the shadow ring: allocate
@@ -1357,7 +1391,6 @@ mod tests {
     // ---- Reconnect (plan commit 25) ----
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 25"]
     fn rebuild_republishes_inflight_in_submission_order() {
         let mut h = harness(8, 8192);
         // Submit three chains; the backend consumes but never completes.
@@ -1388,7 +1421,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 25"]
     fn rebuild_with_empty_inflight_publishes_nothing() {
         let mut h = harness(8, 8192);
         h.pool.zero_rings().unwrap();
@@ -1399,7 +1431,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 25"]
     fn rebuild_preserves_pool_data_and_completes_once() {
         let mut h = harness(8, 8192);
         let (req, resp) = (h.ring.alloc_buf(64), h.ring.alloc_buf(64));

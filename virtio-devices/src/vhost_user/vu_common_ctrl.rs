@@ -453,6 +453,7 @@ impl VhostUserHandle {
         acked_protocol_features: u64,
         backend_req_handler: &Option<FrontendReqHandler<S>>,
         inflight: Option<&mut Inflight>,
+        vring_bases: Option<&[u64]>,
         bounce: Option<&BounceSetup>,
     ) -> Result<()> {
         self.set_protocol_features_vhost_user(acked_features, acked_protocol_features)?;
@@ -464,7 +465,7 @@ impl VhostUserHandle {
             acked_features,
             backend_req_handler,
             inflight,
-            None,
+            vring_bases,
             bounce,
         )
     }

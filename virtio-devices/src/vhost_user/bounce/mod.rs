@@ -30,7 +30,7 @@ use thiserror::Error;
 use vm_memory::mmap::MmapRegionError;
 use vm_memory::{GuestMemoryError, GuestRegionCollectionError};
 use vmm_sys_util::eventfd::EventFd;
-pub use worker::{BounceEpollHandler, BounceShared};
+pub use worker::{BounceEpollHandler, BounceReconnect, BounceShared};
 
 /// Per-device configuration for bounce mode, parsed from the CLI.
 #[derive(Clone, Debug, Default)]
