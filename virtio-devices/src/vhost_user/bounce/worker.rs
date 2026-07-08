@@ -12,7 +12,7 @@
 //! consistent (see `docs/vhost-user-bounce-plan.md` §2.5-2.6).
 
 use std::os::unix::io::AsRawFd;
-use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -57,7 +57,7 @@ pub struct BounceEpollHandler {
     pub drain_timeout: Duration,
     /// Device-level count of chains owned by the backend, published so
     /// snapshotting can refuse while requests are in flight. Maintained
-    /// by the mirror/complete paths in the next commit.
+    /// by the mirror and completion paths.
     pub inflight_total: Arc<AtomicUsize>,
 }
 
@@ -131,6 +131,8 @@ impl BounceEpollHandler {
         let outcome = shadow[i].mirror_avail(&mem, &mut self.queues[i].1, pool);
         drop(guard);
         if outcome.chains > 0 {
+            self.inflight_total
+                .fetch_add(outcome.chains, Ordering::Relaxed);
             let _ = self.fds[i].shadow_kick.write(1);
         }
     }
@@ -143,6 +145,10 @@ impl BounceEpollHandler {
         let BounceShared { pool, shadow } = &mut *guard;
         let outcome = shadow[i].complete_used(&mem, &mut self.queues[i].1, pool);
         drop(guard);
+        if outcome.chains > 0 {
+            self.inflight_total
+                .fetch_sub(outcome.chains, Ordering::Relaxed);
+        }
         if outcome.needs_interrupt {
             let qidx = self.queues[i].0 as u16;
             let _ = self.interrupt.trigger(VirtioInterruptType::Queue(qidx));
@@ -503,7 +509,6 @@ mod tests {
     // ---- Restore priming & inflight tracking (plan commit 23) ----
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 23"]
     fn worker_tracks_inflight_total() {
         let mut h = build(1, 8, 8192);
         h.start();
@@ -534,7 +539,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 23"]
     fn pause_drains_to_zero_inflight() {
         let mut h = build(1, 8, 8192);
         h.start();
@@ -563,7 +567,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 23"]
     fn pause_with_wedged_daemon_times_out() {
         // A backend that never completes must not block pause forever; the
         // drain gives up after the (short, test-tuned) timeout, leaving the

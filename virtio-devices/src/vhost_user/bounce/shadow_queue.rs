@@ -536,7 +536,7 @@ impl ShadowQueue {
     /// backend has been copied back to the guest. A snapshot is only
     /// consistent once every queue reports drained.
     pub fn verify_drained(&self) -> bool {
-        todo!("implemented in docs/vhost-user-bounce-plan.md commit 23")
+        self.inflight_count == 0
     }
 
     /// A spec violation was detected; the queue no longer processes
@@ -1239,7 +1239,6 @@ mod tests {
     // ---- Restore priming (plan commit 23) ----
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 23"]
     fn verify_drained_reflects_inflight() {
         let mut h = harness(8, 8192);
         assert!(h.sq.verify_drained());
@@ -1254,7 +1253,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 23"]
     fn restore_mirror_between_base_and_avail_idx() {
         // A queue restored with avail idx 5, used idx 3, backend base 3
         // must mirror exactly the two chains 3 and 4 on the first sweep.
@@ -1280,7 +1278,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 23"]
     fn restore_base_equal_avail_idx_is_noop() {
         let mut h = harness(8, 8192);
         h.ring.set_start(&h.mem, 7);
@@ -1294,7 +1291,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 23"]
     fn restore_with_wrapped_indices() {
         // Base near u16::MAX so the restored indices wrap during mirroring.
         let base = u16::MAX - 1;
