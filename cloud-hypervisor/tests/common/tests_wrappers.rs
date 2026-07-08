@@ -702,6 +702,43 @@ pub(crate) fn test_vhost_user_blk(
     direct: bool,
     prepare_vhost_user_blk_daemon: Option<&PrepareBlkDaemon>,
 ) {
+    test_vhost_user_blk_inner(
+        num_queues,
+        readonly,
+        direct,
+        false,
+        false,
+        prepare_vhost_user_blk_daemon,
+    );
+}
+
+/// `test_vhost_user_blk` with the bounce buffer pool (`bounce=on`) and,
+/// optionally, a vIOMMU (`iommu=on`) in front of the vhost-user-blk
+/// device. Exercises the data-plane worker's mirroring/copy-back path and
+/// — with `iommu` — the ShadowQueue IOVA translation, end to end.
+pub(crate) fn test_vhost_user_blk_bounce(
+    num_queues: usize,
+    iommu: bool,
+    prepare_vhost_user_blk_daemon: Option<&PrepareBlkDaemon>,
+) {
+    test_vhost_user_blk_inner(
+        num_queues,
+        false,
+        false,
+        true,
+        iommu,
+        prepare_vhost_user_blk_daemon,
+    );
+}
+
+fn test_vhost_user_blk_inner(
+    num_queues: usize,
+    readonly: bool,
+    direct: bool,
+    bounce: bool,
+    iommu: bool,
+    prepare_vhost_user_blk_daemon: Option<&PrepareBlkDaemon>,
+) {
     let disk_config = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME.to_string());
     let guest = Guest::new(Box::new(disk_config));
     let api_socket = temp_api_path(&guest.tmp_dir);
@@ -714,12 +751,16 @@ pub(crate) fn test_vhost_user_blk(
         let (daemon_child, vubd_socket_path) =
             prepare_daemon(&guest.tmp_dir, "blk.img", num_queues, readonly, direct);
 
-        (
-            format!(
-                "vhost_user=true,socket={vubd_socket_path},num_queues={num_queues},queue_size=128",
-            ),
-            Some(daemon_child),
-        )
+        let mut params = format!(
+            "vhost_user=true,socket={vubd_socket_path},num_queues={num_queues},queue_size=128",
+        );
+        if bounce {
+            params.push_str(",bounce=on");
+        }
+        if iommu {
+            params.push_str(",iommu=on");
+        }
+        (params, Some(daemon_child))
     };
 
     let mut child = GuestCommand::new(&guest)
@@ -800,9 +841,10 @@ pub(crate) fn test_vhost_user_blk(
             "bar"
         );
 
-        // ACPI feature is needed.
+        // ACPI feature is needed. Skipped behind a vIOMMU, where memory
+        // hotplug is out of scope for this test.
         #[cfg(target_arch = "x86_64")]
-        {
+        if !iommu {
             guest.enable_memory_hotplug();
 
             // Add RAM to the VM

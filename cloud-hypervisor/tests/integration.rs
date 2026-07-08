@@ -2162,6 +2162,18 @@ mod common_parallel {
     }
 
     #[test]
+    #[cfg(not(target_arch = "aarch64"))]
+    fn test_vhost_user_blk_bounce_default() {
+        test_vhost_user_blk_bounce(2, false, Some(&prepare_vubd));
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn test_vhost_user_blk_bounce_iommu() {
+        test_vhost_user_blk_bounce(1, true, Some(&prepare_vubd));
+    }
+
+    #[test]
     fn test_boot_from_vhost_user_blk_default() {
         test_boot_from_vhost_user_blk(1, false, false, Some(&prepare_vubd));
     }

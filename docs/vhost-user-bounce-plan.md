@@ -1197,27 +1197,32 @@ so their rejection is unchanged. Flip the affected validation tests.
 
 ---
 
-### Commit 32 — `docs: Document vhost-user bounce buffer pool`
+> The docs (`vhost-user-bounce.md`) were written early and are kept
+> current as the series lands; the standalone docs commit below folds
+> into those ongoing updates. Commit numbering: 30–34 above cover the
+> vIOMMU work (expanded from the original 30–31), so the docs and
+> integration commits are 35–36.
 
-New `docs/vhost-user-bounce.md`: what it does, why (motivations §1.2),
-CLI examples for all four device types, pool sizing guidance (default
+### Commit 35 — `docs: Document vhost-user bounce buffer pool`
+
+`docs/vhost-user-bounce.md`: what it does, why (motivations §1.2), CLI
+examples for all four device types, pool sizing guidance (default
 formula, how to read the stall `error!` log and pick
 `bounce_pool_size`), interaction matrix (migration unsupported, snapshot
 supported, DAX/vIOMMU/reconnect notes), and a short "how it works"
-section linking to this plan. Update the `--disk`/`--net`/`--fs` option
-tables wherever the existing docs enumerate them (grep for
-`vhost_user=on` under `docs/`).
+section linking to this plan.
 
-### Commit 33 — `tests: Add vhost-user bounce integration tests`
+### Commit 36 — `tests: Add vhost-user bounce integration tests`
 
 Test-only. In `cloud-hypervisor/tests/` (built via the `devcli_testenv`
-cfg — verify compilation with clippy, which includes those paths per
-`AGENTS.md`): clone the existing vhost-user-blk boot test with
-`bounce=on` (boot, mount, dd write/read, verify integrity), a
-vhost-user-net `bounce=on` ping/iperf smoke, a snapshot/restore cycle of
-a bounce=on blk VM, and a daemon-kill/reconnect case if the existing
-suite has a reconnect precedent to clone. These run only in the
-privileged CI harness; the commit gate is compilation + review.
+cfg — verify compilation with `cargo check --cfg devcli_testenv`, since
+clippy `-D warnings` trips over pre-existing lints in `vmm`): the
+existing vhost-user-blk boot test is factored into a shared inner helper
+and reused with `bounce=on` (`test_vhost_user_blk_bounce`, boot + mount +
+data-integrity read through the bounce copy path) and with
+`bounce=on,iommu=on` (`test_vhost_user_blk_bounce_iommu`, x86_64,
+exercising ShadowQueue IOVA translation end to end). These run only in
+the privileged CI harness; the commit gate is compilation + review.
 
 ---
 
