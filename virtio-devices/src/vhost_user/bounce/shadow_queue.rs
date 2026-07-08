@@ -82,6 +82,42 @@ struct InflightChain {
     segments: Vec<Segment>,
     /// Shadow descriptor slots used by this chain, head first.
     slots: Vec<u16>,
+    /// Monotonic submission order, used to re-publish chains in their
+    /// original order after a backend reconnect.
+    // TODO: expect(dead_code) is removed when the next commit implements
+    // rebuild_for_reconnect (docs/vhost-user-bounce-plan.md commit 25).
+    #[expect(dead_code)]
+    seq: u64,
+}
+
+/// Write a chain's descriptors into the shadow descriptor table at
+/// `slots`, chaining them with `F_NEXT`. `descs` is (pool addr, len,
+/// writable) per slot. Returns false on a pool write error (impossible
+/// for a valid pool, treated as an internal error by callers).
+fn write_shadow_chain(
+    pool: &BouncePool,
+    ring: &RingOffsets,
+    slots: &[u16],
+    descs: &[(GuestAddress, u32, bool)],
+) -> bool {
+    for (i, (addr, len, writable)) in descs.iter().enumerate() {
+        let mut flags = 0u16;
+        if *writable {
+            flags |= VRING_DESC_F_WRITE as u16;
+        }
+        let next = if i + 1 < slots.len() {
+            flags |= VRING_DESC_F_NEXT as u16;
+            slots[i + 1]
+        } else {
+            0
+        };
+        let shadow = Descriptor::new(addr.raw_value(), *len, flags, next);
+        let a = GuestAddress(ring.desc + u64::from(slots[i]) * 16);
+        if pool.mem().write_obj(shadow, a).is_err() {
+            return false;
+        }
+    }
+    true
 }
 
 /// Mirrors one guest virtqueue into a shadow ring inside the pool.
@@ -97,6 +133,9 @@ pub struct ShadowQueue {
     shadow_avail_idx: Wrapping<u16>,
     /// Next shadow used entry to consume.
     next_used: Wrapping<u16>,
+    /// Monotonic sequence assigned to each mirrored chain, so reconnect
+    /// can re-publish in-flight chains in submission order.
+    next_seq: u64,
     /// Scratch buffer for chunked guest<->pool copies.
     scratch: Vec<u8>,
     broken: bool,
@@ -119,6 +158,7 @@ impl ShadowQueue {
             inflight_count: 0,
             shadow_avail_idx: Wrapping(0),
             next_used: Wrapping(0),
+            next_seq: 0,
             scratch: Vec::new(),
             broken: false,
             stalled: false,
@@ -139,6 +179,16 @@ impl ShadowQueue {
         self.broken = false;
         self.stalled = false;
         self.stall_logged = false;
+    }
+
+    /// Re-establish the shadow ring for a reconnected backend. The pool
+    /// extents of in-flight chains are still intact (never freed on
+    /// disconnect); this re-writes their shadow descriptors and re-publishes
+    /// them as avail entries, in original submission order, starting at
+    /// `new_base`. The caller must have zeroed the shadow rings first.
+    /// Returns the new shadow avail index the backend should be given.
+    pub fn rebuild_for_reconnect(&mut self, _pool: &mut BouncePool, _new_base: u16) -> u16 {
+        todo!("implemented in docs/vhost-user-bounce-plan.md commit 25")
     }
 
     /// Translate new guest avail entries into the shadow ring: allocate
@@ -252,25 +302,16 @@ impl ShadowQueue {
                 // Availability was checked above.
                 slots.push(self.free_slots.pop().unwrap());
             }
-            for (i, (desc, extent)) in descs.iter().zip(&extents).enumerate() {
-                let mut flags = 0u16;
-                if desc.is_write_only() {
-                    flags |= VRING_DESC_F_WRITE as u16;
-                }
-                let next = if i + 1 < count {
-                    flags |= VRING_DESC_F_NEXT as u16;
-                    slots[i + 1]
-                } else {
-                    0
-                };
-                let shadow = Descriptor::new(extent.raw_value(), desc.len(), flags, next);
-                let addr = GuestAddress(self.ring.desc + u64::from(slots[i]) * 16);
-                // Writes into the pool cannot fail (fixed, mapped, in
-                // bounds); treat failure as an internal error.
-                if pool.mem().write_obj(shadow, addr).is_err() {
-                    self.mark_broken("shadow descriptor write failed");
-                    break 'chains;
-                }
+            let specs: Vec<(GuestAddress, u32, bool)> = descs
+                .iter()
+                .zip(&extents)
+                .map(|(d, a)| (*a, d.len(), d.is_write_only()))
+                .collect();
+            // Writes into the pool cannot fail (fixed, mapped, in bounds);
+            // treat failure as an internal error.
+            if !write_shadow_chain(pool, &self.ring, &slots, &specs) {
+                self.mark_broken("shadow descriptor write failed");
+                break 'chains;
             }
 
             // Publish the avail entry (the index store below makes the
@@ -295,10 +336,13 @@ impl ShadowQueue {
                 .collect();
             let head_slot = usize::from(slots[0]);
             debug_assert!(self.inflight[head_slot].is_none());
+            let seq = self.next_seq;
+            self.next_seq += 1;
             self.inflight[head_slot] = Some(InflightChain {
                 guest_head,
                 segments,
                 slots,
+                seq,
             });
             self.inflight_count += 1;
 
@@ -1308,6 +1352,80 @@ mod tests {
         assert_eq!(mirror(&mut h).chains, 3);
         // base + 3 wraps past u16::MAX to 1.
         assert_eq!(h.daemon.avail_idx(&h.pool, 0), base.wrapping_add(3));
+    }
+
+    // ---- Reconnect (plan commit 25) ----
+
+    #[test]
+    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 25"]
+    fn rebuild_republishes_inflight_in_submission_order() {
+        let mut h = harness(8, 8192);
+        // Submit three chains; the backend consumes but never completes.
+        for _ in 0..3 {
+            let buf = h.ring.alloc_buf(64);
+            let head = h.ring.chain(&h.mem, &[(buf, 64, true)]);
+            h.ring.publish(&h.mem, head);
+        }
+        assert_eq!(mirror(&mut h).chains, 3);
+        for _ in 0..3 {
+            h.daemon.pop_avail(&h.pool, 0);
+        }
+
+        // The backend disconnects. Rebuild at a fresh base 0.
+        h.pool.zero_rings().unwrap();
+        let new_idx = h.sq.rebuild_for_reconnect(&mut h.pool, 0);
+        assert_eq!(new_idx, 3);
+
+        // A fresh backend session sees the three chains, still in flight.
+        let mut daemon = FakeDaemon::new(1, 8);
+        assert_eq!(daemon.avail_idx(&h.pool, 0), 3);
+        for _ in 0..3 {
+            let shadow_head = daemon.pop_avail(&h.pool, 0);
+            let chain = daemon.read_chain(&h.pool, 0, shadow_head);
+            assert_eq!(chain.len(), 1);
+        }
+        assert_eq!(h.sq.inflight_count(), 3);
+    }
+
+    #[test]
+    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 25"]
+    fn rebuild_with_empty_inflight_publishes_nothing() {
+        let mut h = harness(8, 8192);
+        h.pool.zero_rings().unwrap();
+        let new_idx = h.sq.rebuild_for_reconnect(&mut h.pool, 5);
+        assert_eq!(new_idx, 5);
+        let daemon = FakeDaemon::new(1, 8);
+        assert_eq!(daemon.avail_idx(&h.pool, 0), 5);
+    }
+
+    #[test]
+    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 25"]
+    fn rebuild_preserves_pool_data_and_completes_once() {
+        let mut h = harness(8, 8192);
+        let (req, resp) = (h.ring.alloc_buf(64), h.ring.alloc_buf(64));
+        fill(&h.mem, req, 64, 0xa1);
+        let head = h.ring.chain(&h.mem, &[(req, 64, false), (resp, 64, true)]);
+        h.ring.publish(&h.mem, head);
+        assert_eq!(mirror(&mut h).chains, 1);
+        let shadow_head = h.daemon.pop_avail(&h.pool, 0);
+        let chain = h.daemon.read_chain(&h.pool, 0, shadow_head);
+        let readable_pool_addr = chain[0].addr();
+
+        // Reconnect: rebuild at base 0. The readable data must survive.
+        h.pool.zero_rings().unwrap();
+        assert_eq!(h.sq.rebuild_for_reconnect(&mut h.pool, 0), 1);
+        assert_eq!(
+            read_back(h.pool.mem(), readable_pool_addr.raw_value(), 64),
+            vec![0xa1; 64]
+        );
+
+        // The reconnected backend re-executes it; completion lands once.
+        let mut daemon = FakeDaemon::new(1, 8);
+        daemon.serve_one(&h.pool, 0, 0x77);
+        assert_eq!(complete(&mut h).chains, 1);
+        assert_eq!(read_back(&h.mem, resp, 64), vec![0x77; 64]);
+        assert_eq!(h.ring.used_elem(&h.mem, 0), (u32::from(head), 64));
+        assert_eq!(h.sq.inflight_count(), 0);
     }
 
     #[test]
