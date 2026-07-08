@@ -68,7 +68,7 @@ ordinary guest. The feature is strictly opt-in per device.
 | Live migration | Not supported with bounce: `start_dirty_log` returns an error. |
 | Snapshot/restore | Supported. Pause fully drains in-flight requests (bounded wait); restore re-establishes shadow state. No pool contents are serialized. |
 | virtio-fs DAX / shared-memory cache | Orthogonal, keeps working. The cache window is daemon memory mapped toward the guest, not guest RAM; it does not pass through the mem table we replace. No exclusivity check. |
-| vIOMMU (`iommu=on`) | Rejected by config validation until commits 30–31 add IOVA translation; then allowed. |
+| vIOMMU (`iommu=on`) | Rejected by config validation until commits 30–34 add VMM-side IOVA translation; then allowed for bounce devices (the only vhost-user path that supports a vIOMMU in CH). |
 | Daemon reconnect | Supported (commits 24–25): re-publish pool + rings, re-submit in-flight chains. Same double-execution caveats as existing reconnect. |
 | Scrub-on-free | Always on: freed pool extents are zeroed so a daemon can never read stale data from a previous request. |
 | `unsafe` | Forbidden in new code. The only `unsafe` involved is the *pre-existing* `memfd_create` FFI wrapper in `vu_common_ctrl.rs`, which commit 3 relocates verbatim (approved). `MmapRegion::build` and all copies use safe vm-memory APIs. |
@@ -885,7 +885,7 @@ schema). (~80 LOC.)
 
 Validation rules (in `DiskConfig::validate` / equivalent):
 - `bounce=on` requires `vhost_user=on` → new `ValidationError` variant.
-- `bounce=on` with `pci_common.iommu=true` → rejected (until commit 31).
+- `bounce=on` with `pci_common.iommu=true` → rejected (until commit 34 relaxes it).
 - `bounce_pool_size` without `bounce=on` → rejected.
 
 **Tests:** `disk_parse_bounce_defaults_off`, `disk_parse_bounce_on`,
@@ -1126,11 +1126,25 @@ Set `queue.set_event_idx(acked)` for the guest-side queues, use
 the race re-check pattern used by CH's emulated net/blk handlers), remove
 the bit from `mask_bounce_features`, update mask tests, unignore. (~90 LOC.)
 
+### vIOMMU support: context
+
+Cloud Hypervisor rejects vhost-user behind a vIOMMU wholesale today
+(`config.rs`: `vhost_user && iommu → IommuNotSupported`), because normal
+vhost-user hands the guest virtqueue to the daemon and there is no
+vhost-user IOTLB plumbing to translate IOVAs for it. Bounce is the one
+vhost-user data path where a vIOMMU *can* work without any IOTLB
+protocol: the daemon only ever sees the pool (GPA 0, identity), and the
+**VMM translates IOVA→GPA itself** while mirroring. So these commits make
+bounce the first (and only) way to place a vhost-user device behind a
+guest vIOMMU in CH. Both direct and indirect descriptors are supported;
+nothing is masked.
+
 ### Commit 30 — `virtio-devices: Add vIOMMU translation interface for bounce`
 
 Ignored tests (~30 LOC changes): thread an
-`Option<Arc<dyn AccessPlatform>>` into `ShadowQueue` (mirroring how
-`block.rs` passes it to `Request::parse`):
+`Option<Arc<dyn AccessPlatform>>` into `ShadowQueue` via a
+`set_access_platform` setter (mirroring how `block.rs` passes it to
+`Request::parse`):
 - `mirror_translates_desc_addresses_via_access_platform` (mock
   `AccessPlatform` adding a fixed offset; copy-in reads from translated
   GPA)
@@ -1139,14 +1153,42 @@ Ignored tests (~30 LOC changes): thread an
 - `no_access_platform_means_identity` (existing tests still pass — no new
   test, just an invariant note)
 
-### Commit 31 — `virtio-devices: Implement vIOMMU support for bounce`
+### Commit 31 — `virtio-devices: Translate direct chains for bounce vIOMMU`
 
-Apply `AccessPlatform::translate_gva` to descriptor addresses during
-mirroring (ring addresses are already translated by the transport before
-`activate`), plumb `common.access_platform()` from the devices, and
-**relax the vmm validation** from commits 16/19/20/21 (delete the iommu
-rejection + flip those validation tests to acceptance). Unignore
-commit-30 tests. (~80 LOC across virtio-devices + vmm.)
+Apply `AccessPlatform::translate_gva` to each direct-chain descriptor
+buffer address during mirroring, before range-checking, copy-in, and
+capture (so copy-back also uses the translated GPA). Translation failure
+marks the queue broken. Unignore the three commit-30 tests. (~40 LOC.)
+
+### Commit 32 — `virtio-devices: Add translated indirect-walk interface`
+
+`virtio-queue`'s `DescriptorChain` flattens an indirect table using the
+raw (untranslated) table pointer, so under a vIOMMU it would read the
+wrong memory. Add ignored tests for a hand-rolled *translated* indirect
+walk (mock `AccessPlatform`; the head's table pointer and every entry's
+buffer address are IOVAs):
+- `indirect_table_pointer_is_translated`
+- `indirect_entry_addresses_are_translated`
+- `indirect_table_translation_failure_marks_broken`
+
+### Commit 33 — `virtio-devices: Implement translated indirect walk`
+
+When a translator is installed and the head is indirect, translate the
+table pointer, read the table from the translated GPA, and translate each
+entry's buffer address — instead of relying on virtio-queue's flatten.
+The no-vIOMMU path keeps using virtio-queue's flatten unchanged. Unignore
+commit-32 tests. (~70 LOC.)
+
+### Commit 34 — `virtio-devices/vmm: Enable bounce behind a vIOMMU`
+
+Override `set_access_platform`/`access_platform()` on the four vhost-user
+devices to store the `Arc<dyn AccessPlatform>` (so the transport
+translates their ring addresses) and thread it into every `ShadowQueue`
+at activation via `set_access_platform`. **Relax the vmm validation**: the
+bounce+iommu rejection is removed and the generic vhost-user+iommu
+rejection becomes `vhost_user && iommu && !bounce` (non-bounce
+vhost-user+iommu stays rejected). Flip the affected validation tests.
+(~90 LOC across virtio-devices + vmm.)
 
 ---
 
@@ -1181,7 +1223,7 @@ privileged CI harness; the commit gate is compilation + review.
 | `bounce=on` + live migration | `start_dirty_log` fails; migration aborts cleanly. |
 | `bounce=on` + snapshot/restore | Supported; pause drains; snapshot fails if a wedged daemon left in-flight requests. |
 | `bounce=on` + memory hotplug | Guest RAM changes are invisible to the daemon (no-op); pool unaffected. |
-| `bounce=on` + `iommu=on` | Supported from commit 31 (rejected by validation before that). |
+| `bounce=on` + `iommu=on` | Supported from commit 34 (rejected by validation before that); non-bounce vhost-user+iommu stays rejected. |
 | `bounce=on` + fs DAX / generic cache | Allowed; cache windows are daemon→guest mappings outside the mem table. |
 | `bounce=on` + daemon reconnect | Supported from commit 25; in-flight requests are re-executed (at-least-once). |
 | `bounce=on` + INFLIGHT_SHMFD | Still negotiated (harmless); CH's own in-flight table is authoritative for re-submission. |

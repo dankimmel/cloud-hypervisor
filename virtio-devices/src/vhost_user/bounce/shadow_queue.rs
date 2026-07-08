@@ -19,6 +19,7 @@
 //!   guest descriptor-table rewrites).
 
 use std::num::Wrapping;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use log::error;
@@ -28,6 +29,7 @@ use virtio_bindings::virtio_ring::{
 use virtio_queue::desc::split::Descriptor;
 use virtio_queue::{Queue, QueueOwnedT, QueueT};
 use vm_memory::{Address, Bytes, GuestAddress, GuestMemory, GuestMemoryError};
+use vm_virtio::AccessPlatform;
 
 use super::allocator::BOUNCE_ALLOC_ALIGN;
 use super::pool::{BouncePool, RingOffsets};
@@ -174,6 +176,12 @@ pub struct ShadowQueue {
     stalled: bool,
     /// Set once the current stall episode has been logged.
     stall_logged: bool,
+    /// vIOMMU translator for descriptor buffer addresses. `None` (the
+    /// default, no vIOMMU) means guest addresses are already GPAs; when set,
+    /// every descriptor buffer address (and indirect-table pointer) is an
+    /// IOVA translated to a GPA before access. Read by mirror_avail once
+    /// translation is wired in plan commit 31.
+    access_platform: Option<Arc<dyn AccessPlatform>>,
 }
 
 impl ShadowQueue {
@@ -195,7 +203,15 @@ impl ShadowQueue {
             broken: false,
             stalled: false,
             stall_logged: false,
+            access_platform: None,
         }
+    }
+
+    /// Install (or clear) the vIOMMU translator applied to descriptor
+    /// buffer addresses during mirroring. Set once at activation, before
+    /// the first `mirror_avail`; independent of session resets.
+    pub fn set_access_platform(&mut self, access_platform: Option<Arc<dyn AccessPlatform>>) {
+        self.access_platform = access_platform;
     }
 
     /// Re-initialize counters for a fresh backend session starting at
@@ -775,6 +791,8 @@ impl ShadowQueue {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+
     use virtio_bindings::virtio_ring::{
         VRING_AVAIL_F_NO_INTERRUPT, VRING_DESC_F_INDIRECT, VRING_DESC_F_NEXT,
     };
@@ -1180,6 +1198,99 @@ mod tests {
         h.ring.publish(&h.mem, head);
         assert_eq!(mirror(&mut h).chains, 1);
         assert_eq!(h.daemon.avail_flags(&h.pool, 0), 0);
+    }
+
+    // ---- vIOMMU translation (plan commit 31) ----
+
+    /// AccessPlatform stub mapping an IOVA to a GPA by a fixed offset: the
+    /// guest descriptor carries `gpa + offset`, translation recovers `gpa`.
+    #[derive(Debug)]
+    struct OffsetTranslator {
+        offset: u64,
+    }
+
+    impl AccessPlatform for OffsetTranslator {
+        fn translate_gva(&self, base: u64, _size: u64) -> io::Result<u64> {
+            Ok(base - self.offset)
+        }
+        fn translate_gpa(&self, base: u64, _size: u64) -> io::Result<u64> {
+            Ok(base + self.offset)
+        }
+    }
+
+    /// AccessPlatform stub that always fails translation.
+    #[derive(Debug)]
+    struct FailingTranslator;
+
+    impl AccessPlatform for FailingTranslator {
+        fn translate_gva(&self, _base: u64, _size: u64) -> io::Result<u64> {
+            Err(io::Error::other("iova translation failed"))
+        }
+        fn translate_gpa(&self, _base: u64, _size: u64) -> io::Result<u64> {
+            Err(io::Error::other("iova translation failed"))
+        }
+    }
+
+    const TEST_IOVA_OFFSET: u64 = 0x8000_0000;
+
+    #[test]
+    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 31"]
+    fn mirror_translates_desc_addresses_via_access_platform() {
+        let mut h = harness(8, 8192);
+        h.sq.set_access_platform(Some(Arc::new(OffsetTranslator {
+            offset: TEST_IOVA_OFFSET,
+        })));
+        let gpa = h.ring.alloc_buf(512);
+        fill(&h.mem, gpa, 512, 0x5a);
+        // The descriptor carries the IOVA; the data lives at the GPA the
+        // translator maps it to. The IOVA itself is well outside guest RAM,
+        // so a correct copy-in must translate before reading and before
+        // range-checking.
+        let head = h
+            .ring
+            .chain(&h.mem, &[(gpa + TEST_IOVA_OFFSET, 512, false)]);
+        h.ring.publish(&h.mem, head);
+        assert_eq!(mirror(&mut h).chains, 1);
+
+        let shadow_head = h.daemon.pop_avail(&h.pool, 0);
+        let chain = h.daemon.read_chain(&h.pool, 0, shadow_head);
+        assert_eq!(
+            read_back(h.pool.mem(), chain[0].addr().raw_value(), 512),
+            vec![0x5a; 512]
+        );
+    }
+
+    #[test]
+    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 31"]
+    fn copyback_uses_translated_addresses() {
+        let mut h = harness(8, 8192);
+        h.sq.set_access_platform(Some(Arc::new(OffsetTranslator {
+            offset: TEST_IOVA_OFFSET,
+        })));
+        let gpa = h.ring.alloc_buf(256);
+        fill(&h.mem, gpa, 256, 0x00);
+        let head = h.ring.chain(&h.mem, &[(gpa + TEST_IOVA_OFFSET, 256, true)]);
+        h.ring.publish(&h.mem, head);
+        assert_eq!(mirror(&mut h).chains, 1);
+
+        h.daemon.serve_one(&h.pool, 0, 0x77);
+        assert_eq!(complete(&mut h).chains, 1);
+        // Device-written data must land at the translated GPA.
+        assert_eq!(read_back(&h.mem, gpa, 256), vec![0x77; 256]);
+    }
+
+    #[test]
+    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 31"]
+    fn translation_failure_marks_queue_broken() {
+        let mut h = harness(8, 8192);
+        h.sq.set_access_platform(Some(Arc::new(FailingTranslator)));
+        let gpa = h.ring.alloc_buf(64);
+        let head = h.ring.chain(&h.mem, &[(gpa, 64, false)]);
+        h.ring.publish(&h.mem, head);
+        assert_eq!(mirror(&mut h).chains, 0);
+        assert!(h.sq.is_broken());
+        // A failed translation consumes no pool space.
+        assert_eq!(h.pool.free_bytes(), h.pool.buffer_capacity());
     }
 
     #[test]
