@@ -216,6 +216,14 @@ all configuration space access will be handled by it.  Otherwise,
 writes will be ignored and reads will return 0xFF. Cloud Hypervisor
 warns if this happens.
 
+### Bounce buffer pool
+
+All of the vhost-user devices above accept an optional `bounce=on`
+parameter that routes their I/O through a Cloud Hypervisor-managed
+bounce buffer pool, so the backend never gains access to guest RAM. See
+the [bounce buffer pool](vhost-user-bounce.md) documentation for the
+rationale, usage, pool sizing, and feature interactions.
+
 This device is always built-in, and it is enabled when the
 `--generic-vhost-user` flag is passed.
 See [the generic vhost-user documentation](generic-vhost-user.md) for more details.
