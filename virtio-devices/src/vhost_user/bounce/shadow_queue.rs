@@ -178,9 +178,9 @@ pub struct ShadowQueue {
     stall_logged: bool,
     /// vIOMMU translator for descriptor buffer addresses. `None` (the
     /// default, no vIOMMU) means guest addresses are already GPAs; when set,
-    /// every descriptor buffer address (and indirect-table pointer) is an
-    /// IOVA translated to a GPA before access. Read by mirror_avail once
-    /// translation is wired in plan commit 31.
+    /// every descriptor buffer address (and, once the translated indirect
+    /// walk lands, the indirect-table pointer) is an IOVA translated to a
+    /// GPA before access.
     access_platform: Option<Arc<dyn AccessPlatform>>,
 }
 
@@ -212,6 +212,20 @@ impl ShadowQueue {
     /// the first `mirror_avail`; independent of session resets.
     pub fn set_access_platform(&mut self, access_platform: Option<Arc<dyn AccessPlatform>>) {
         self.access_platform = access_platform;
+    }
+
+    /// Translate a descriptor buffer IOVA to a GPA through the vIOMMU.
+    /// Identity when no translator is installed (no vIOMMU). `len` bounds
+    /// the translated range. `Err(())` on a translation failure, which the
+    /// caller turns into a broken queue.
+    fn translate(&self, addr: GuestAddress, len: u32) -> Result<GuestAddress, ()> {
+        match &self.access_platform {
+            None => Ok(addr),
+            Some(ap) => ap
+                .translate_gva(addr.raw_value(), u64::from(len))
+                .map(GuestAddress)
+                .map_err(|_| ()),
+        }
     }
 
     /// Re-initialize counters for a fresh backend session starting at
@@ -340,8 +354,26 @@ impl ShadowQueue {
                 self.mark_broken("descriptor chain longer than the queue");
                 break 'chains;
             }
+            // Translate each buffer address through the vIOMMU (identity
+            // when none), then range-check the translated GPA. Everything
+            // downstream — copy-in, capture, copy-back — uses `xaddrs`.
+            let mut xaddrs: Vec<GuestAddress> = Vec::with_capacity(descs.len());
+            let mut xlate_failed = false;
             for desc in &descs {
-                if desc.len() != 0 && !guest_mem.check_range(desc.addr(), desc.len() as usize) {
+                match self.translate(desc.addr(), desc.len()) {
+                    Ok(a) => xaddrs.push(a),
+                    Err(()) => {
+                        self.mark_broken("descriptor address translation failed");
+                        xlate_failed = true;
+                        break;
+                    }
+                }
+            }
+            if xlate_failed {
+                break 'chains;
+            }
+            for (desc, xaddr) in descs.iter().zip(&xaddrs) {
+                if desc.len() != 0 && !guest_mem.check_range(*xaddr, desc.len() as usize) {
                     self.mark_broken("descriptor buffer outside guest memory");
                     break 'chains;
                 }
@@ -411,12 +443,12 @@ impl ShadowQueue {
             }
 
             // Copy device-readable data into the pool.
-            for (desc, extent) in descs.iter().zip(&extents) {
+            for ((desc, extent), xaddr) in descs.iter().zip(&extents).zip(&xaddrs) {
                 if desc.len() == 0 || desc.is_write_only() {
                     continue;
                 }
                 if let Err(e) = self.copy_chunked(
-                    |buf, offset| guest_mem.read_slice(buf, desc.addr().unchecked_add(offset)),
+                    |buf, offset| guest_mem.read_slice(buf, xaddr.unchecked_add(offset)),
                     |buf, offset| pool.mem().write_slice(buf, extent.unchecked_add(offset)),
                     desc.len(),
                 ) {
@@ -480,8 +512,9 @@ impl ShadowQueue {
             let segments = descs
                 .iter()
                 .zip(&extents)
-                .map(|(d, a)| Segment {
-                    guest_addr: d.addr(),
+                .zip(&xaddrs)
+                .map(|((d, a), xaddr)| Segment {
+                    guest_addr: *xaddr,
                     pool_addr: *a,
                     len: d.len(),
                     writable: d.is_write_only(),
@@ -1234,7 +1267,6 @@ mod tests {
     const TEST_IOVA_OFFSET: u64 = 0x8000_0000;
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 31"]
     fn mirror_translates_desc_addresses_via_access_platform() {
         let mut h = harness(8, 8192);
         h.sq.set_access_platform(Some(Arc::new(OffsetTranslator {
@@ -1261,7 +1293,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 31"]
     fn copyback_uses_translated_addresses() {
         let mut h = harness(8, 8192);
         h.sq.set_access_platform(Some(Arc::new(OffsetTranslator {
@@ -1280,7 +1311,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 31"]
     fn translation_failure_marks_queue_broken() {
         let mut h = harness(8, 8192);
         h.sq.set_access_platform(Some(Arc::new(FailingTranslator)));
