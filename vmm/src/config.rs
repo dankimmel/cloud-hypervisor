@@ -377,9 +377,6 @@ pub enum ValidationError {
     /// A bounce buffer pool was requested without vhost-user
     #[error("Bounce buffer pool (bounce=on) requires vhost_user=on")]
     BounceRequiresVhostUser,
-    /// Bounce buffer pool is not yet supported together with a vIOMMU
-    #[error("Bounce buffer pool (bounce=on) is not supported with iommu=on")]
-    BounceIommuNotSupported,
     /// bounce_pool_size was given without enabling the bounce pool
     #[error("bounce_pool_size requires bounce=on")]
     BouncePoolSizeRequiresBounce,
@@ -1655,21 +1652,17 @@ impl DiskConfig {
             return Err(ValidationError::BlockQueueSizeTooSmall(self.queue_size));
         }
 
-        // Bounce checks precede the generic vhost-user/iommu rejection so
-        // a bounce device produces the clearer bounce-specific error.
         if self.bounce && !self.vhost_user {
             return Err(ValidationError::BounceRequiresVhostUser);
-        }
-
-        if self.bounce && self.pci_common.iommu {
-            return Err(ValidationError::BounceIommuNotSupported);
         }
 
         if self.bounce_pool_size.is_some() && !self.bounce {
             return Err(ValidationError::BouncePoolSizeRequiresBounce);
         }
 
-        if self.vhost_user && self.pci_common.iommu {
+        // A bounce device may sit behind a vIOMMU (the VMM translates IOVAs
+        // itself); non-bounce vhost-user behind a vIOMMU stays rejected.
+        if self.vhost_user && self.pci_common.iommu && !self.bounce {
             return Err(ValidationError::IommuNotSupported);
         }
 
@@ -1922,21 +1915,17 @@ impl NetConfig {
 
         validate_queue_size(self.queue_size)?;
 
-        // Bounce checks precede the generic vhost-user/iommu rejection so
-        // a bounce device produces the clearer bounce-specific error.
         if self.bounce && !self.vhost_user {
             return Err(ValidationError::BounceRequiresVhostUser);
-        }
-
-        if self.bounce && self.pci_common.iommu {
-            return Err(ValidationError::BounceIommuNotSupported);
         }
 
         if self.bounce_pool_size.is_some() && !self.bounce {
             return Err(ValidationError::BouncePoolSizeRequiresBounce);
         }
 
-        if self.vhost_user && self.pci_common.iommu {
+        // A bounce device may sit behind a vIOMMU (the VMM translates IOVAs
+        // itself); non-bounce vhost-user behind a vIOMMU stays rejected.
+        if self.vhost_user && self.pci_common.iommu && !self.bounce {
             return Err(ValidationError::IommuNotSupported);
         }
 
@@ -2182,8 +2171,9 @@ impl GenericVhostUserConfig {
 
     pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
         if self.pci_common.iommu {
-            // Generic vhost-user never supports a vIOMMU, so bounce=on
-            // with iommu is rejected here just as the non-bounce case is.
+            // Generic vhost-user never supports a vIOMMU (the `iommu`
+            // option is not even offered); this guards the defensive
+            // default.
             return Err(ValidationError::IommuNotSupported);
         }
 
@@ -2270,8 +2260,8 @@ impl FsConfig {
         }
 
         if self.pci_common.iommu {
-            // virtio-fs never supports a vIOMMU, so bounce=on with iommu
-            // is rejected here just as the non-bounce case is.
+            // virtio-fs never supports a vIOMMU (the `iommu` option is not
+            // even offered); this guards the defensive default.
             return Err(ValidationError::IommuNotSupported);
         }
 
@@ -4369,11 +4359,14 @@ mod unit_tests {
             Err(ValidationError::BounceRequiresVhostUser)
         ));
 
-        // bounce=on is rejected together with iommu=on.
+        // A bounce device may sit behind a vIOMMU (the VMM translates
+        // IOVAs itself), unlike a non-bounce vhost-user device.
         let disk = DiskConfig::parse("vhost_user=on,socket=/s,bounce=on,iommu=on").unwrap();
+        disk.validate(&vm_config).unwrap();
+        let disk = DiskConfig::parse("vhost_user=on,socket=/s,iommu=on").unwrap();
         assert!(matches!(
             disk.validate(&vm_config),
-            Err(ValidationError::BounceIommuNotSupported)
+            Err(ValidationError::IommuNotSupported)
         ));
 
         // bounce_pool_size requires bounce=on.
@@ -4548,6 +4541,16 @@ mod unit_tests {
         assert!(matches!(
             bad.validate(&vm_config),
             Err(ValidationError::BounceRequiresVhostUser)
+        ));
+        // A bounce device may sit behind a vIOMMU; a non-bounce vhost-user
+        // one may not.
+        let ok =
+            NetConfig::parse("mac=de:ad:be:ef:12:34,vhost_user=on,socket=/s,bounce=on,iommu=on")?;
+        ok.validate(&vm_config).unwrap();
+        let bad = NetConfig::parse("mac=de:ad:be:ef:12:34,vhost_user=on,socket=/s,iommu=on")?;
+        assert!(matches!(
+            bad.validate(&vm_config),
+            Err(ValidationError::IommuNotSupported)
         ));
         Ok(())
     }
@@ -4768,6 +4771,8 @@ mod unit_tests {
             cfg.validate(&vm_config),
             Err(ValidationError::BouncePoolSizeRequiresBounce)
         ));
+        // virtio-fs does not offer the `iommu` option at all, bounce or not.
+        assert!(FsConfig::parse("tag=t,socket=/s,bounce=on,iommu=on").is_err());
         Ok(())
     }
 
@@ -4832,6 +4837,13 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             cfg.validate(&valid_vm_config()),
             Err(ValidationError::BouncePoolSizeRequiresBounce)
         ));
+        // Generic vhost-user does not offer the `iommu` option at all.
+        assert!(
+            GenericVhostUserConfig::parse(
+                "virtio_id=fs,socket=/s,queue_sizes=[256],bounce=on,iommu=on"
+            )
+            .is_err()
+        );
         Ok(())
     }
 

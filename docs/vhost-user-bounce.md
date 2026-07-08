@@ -49,8 +49,12 @@ only where the isolation properties above are worth that trade.
 ## Usage
 
 `bounce=on` is available on every vhost-user device type. It requires a
-vhost-user device (`vhost_user=on` where the option exists) and is
-mutually exclusive with a vIOMMU (`iommu=on`).
+vhost-user device (`vhost_user=on` where the option exists). On the
+device types that offer an `iommu` option (vhost-user-blk and
+vhost-user-net) it may be combined with a vIOMMU (`iommu=on`) — bounce is
+in fact the only vhost-user path that supports one (see [Feature
+interactions](#feature-interactions)). virtio-fs and generic vhost-user
+do not offer `iommu` at all.
 
 ```bash
 # vhost-user-blk
@@ -98,7 +102,7 @@ your cue to raise `bounce_pool_size`.
 | Live migration | Not supported: dirty logging is refused, because the daemon's dirty log only covers the pool, not guest RAM. |
 | Snapshot / restore | Supported. Pause drains in-flight requests first; a snapshot is refused if a wedged daemon left requests in flight. |
 | Memory hotplug | Guest RAM changes are invisible to the daemon (a no-op toward it); the pool is unaffected. |
-| vIOMMU (`iommu=on`) | Rejected by configuration validation. |
+| vIOMMU (`iommu=on`, blk/net only) | Supported — and bounce is the *only* vhost-user path that supports a vIOMMU. Normal vhost-user hands the queue to the daemon, which would need a vhost-user IOTLB to translate IOVAs (not implemented); bounce keeps the data path in the VMM, which translates IOVA→GPA itself while mirroring, so the daemon only ever sees the identity-mapped pool. Both direct and indirect descriptors are translated. Non-bounce vhost-user + `iommu=on` remains rejected. virtio-fs and generic vhost-user do not offer the `iommu` option. |
 | virtio-fs DAX / generic cache window | Allowed. The cache window is daemon memory mapped toward the guest, outside the memory table bounce replaces, so it keeps working. |
 | Daemon reconnect | Supported: the pool and in-flight state are re-established after the daemon restarts. |
 | `bounce=off` (default) | Identical to Cloud Hypervisor without the feature. |
@@ -107,10 +111,11 @@ your cue to raise `bounce_pool_size`.
 
 Indirect descriptors (`VIRTIO_F_RING_INDIRECT_DESC`) are supported: an
 indirect chain is re-published to the daemon as a single pool-side
-indirect table, preserving queue depth. Bounce mode currently masks
-`VIRTIO_F_RING_EVENT_IDX` and `VIRTIO_F_IN_ORDER` from the negotiated
-feature set; neither the guest nor the daemon sees those bits while
-bounce is enabled. Event-idx support is planned.
+indirect table, preserving queue depth. Event-idx
+(`VIRTIO_F_RING_EVENT_IDX`) is supported too: the worker manages both the
+guest-side and shadow-side event fields, applying the guest's interrupt
+suppression while keeping the daemon notifying on every completion. The
+only ring feature bounce mode masks is `VIRTIO_F_IN_ORDER`.
 
 ## How it works
 

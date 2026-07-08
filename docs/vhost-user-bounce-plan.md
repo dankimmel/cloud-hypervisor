@@ -1182,12 +1182,17 @@ commit-32 tests. (~70 LOC.)
 ### Commit 34 — `virtio-devices/vmm: Enable bounce behind a vIOMMU`
 
 Override `set_access_platform`/`access_platform()` on the four vhost-user
-devices to store the `Arc<dyn AccessPlatform>` (so the transport
-translates their ring addresses) and thread it into every `ShadowQueue`
-at activation via `set_access_platform`. **Relax the vmm validation**: the
-bounce+iommu rejection is removed and the generic vhost-user+iommu
-rejection becomes `vhost_user && iommu && !bounce` (non-bounce
-vhost-user+iommu stays rejected). Flip the affected validation tests.
+devices to store the `Arc<dyn AccessPlatform>` in `VhostUserCommon` (so
+the transport translates their ring addresses) and thread it into every
+`ShadowQueue` at activation via `set_access_platform`. Unlike
+`VirtioCommon::set_access_platform`, the `VhostUserCommon` variant does
+*not* mask indirect (bounce translates indirect tables itself); it is
+gated on bounce, so non-bounce/SEV-SNP behavior is unchanged. **Relax the
+vmm validation**: the bounce+iommu rejection is removed and the
+vhost-user+iommu rejection becomes `vhost_user && iommu && !bounce`
+(non-bounce vhost-user+iommu stays rejected). This applies to blk and net
+only — virtio-fs and generic vhost-user do not offer an `iommu` option,
+so their rejection is unchanged. Flip the affected validation tests.
 (~90 LOC across virtio-devices + vmm.)
 
 ---

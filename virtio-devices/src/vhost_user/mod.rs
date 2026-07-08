@@ -26,15 +26,16 @@ use vm_memory::mmap::MmapRegionError;
 use vm_memory::{Address, GuestAddressSpace, GuestMemory, GuestMemoryAtomic};
 use vm_migration::protocol::MemoryRangeTable;
 use vm_migration::{MigratableError, Pausable, Snapshot};
+use vm_virtio::AccessPlatform;
 use vmm_sys_util::eventfd::EventFd;
 use vu_common_ctrl::VhostUserHandle;
 
 use crate::seccomp_filters::Thread;
 use crate::{
     ActivateError, EPOLL_HELPER_EVENT_LAST, EpollHelper, EpollHelperError, EpollHelperHandler,
-    GuestMemoryMmap, GuestRegionMmap, VIRTIO_F_IN_ORDER, VIRTIO_F_NOTIFICATION_DATA,
-    VIRTIO_F_ORDER_PLATFORM, VIRTIO_F_RING_EVENT_IDX, VIRTIO_F_RING_INDIRECT_DESC,
-    VIRTIO_F_VERSION_1, VirtioCommon, VirtioInterrupt,
+    GuestMemoryMmap, GuestRegionMmap, VIRTIO_F_ACCESS_PLATFORM, VIRTIO_F_IN_ORDER,
+    VIRTIO_F_NOTIFICATION_DATA, VIRTIO_F_ORDER_PLATFORM, VIRTIO_F_RING_EVENT_IDX,
+    VIRTIO_F_RING_INDIRECT_DESC, VIRTIO_F_VERSION_1, VirtioCommon, VirtioInterrupt,
 };
 
 pub mod blk;
@@ -508,6 +509,11 @@ pub struct VhostUserCommon {
     pub vring_bases: Option<Vec<u64>>,
     /// Bounce buffer pool state when the device runs in bounce mode.
     pub bounce: Option<bounce::BounceState>,
+    /// vIOMMU translator, set by the transport when the device sits behind
+    /// a vIOMMU. Only consulted in bounce mode (the sole vhost-user path
+    /// that translates IOVAs itself); ignored otherwise so non-bounce
+    /// behavior is unchanged.
+    pub access_platform: Option<Arc<dyn AccessPlatform>>,
     /// Indicates that the backend is no longer reachable. Shared with EPollHandler.
     pub disconnected: Arc<AtomicBool>,
     saved_dirty_log: Option<MemoryRangeTable>,
@@ -528,6 +534,7 @@ fn setup_bounce_session<T: VhostUserFrontendReqHandler>(
     backend_req_handler: &Option<FrontendReqHandler<T>>,
     inflight: Option<&mut Inflight>,
     vring_bases: Option<&[u64]>,
+    access_platform: Option<&Arc<dyn AccessPlatform>>,
     bounce_kill: EventFd,
     bounce_pause: EventFd,
 ) -> result::Result<bounce::BounceEpollHandler, ActivateError> {
@@ -552,6 +559,7 @@ fn setup_bounce_session<T: VhostUserFrontendReqHandler>(
             },
             ring,
         );
+        sq.set_access_platform(access_platform.cloned());
         sq.reset_session(base);
         guard.shadow.push(sq);
     }
@@ -613,6 +621,30 @@ fn setup_bounce_session<T: VhostUserFrontendReqHandler>(
 }
 
 impl VhostUserCommon {
+    /// Store the vIOMMU translator supplied by the transport. Unlike
+    /// `VirtioCommon::set_access_platform`, this does not mask indirect
+    /// descriptors: bounce mode translates indirect tables itself, so the
+    /// guest keeps the feature.
+    pub fn set_access_platform(&mut self, access_platform: Arc<dyn AccessPlatform>) {
+        self.access_platform = Some(access_platform);
+    }
+
+    /// The vIOMMU translator, but only in bounce mode with the guest
+    /// having acked `VIRTIO_F_ACCESS_PLATFORM`. Non-bounce devices return
+    /// `None`, so the transport leaves their addresses untranslated
+    /// exactly as before.
+    pub fn access_platform(&self) -> Option<Arc<dyn AccessPlatform>> {
+        if self.bounce.is_some()
+            && self
+                .virtio_common
+                .feature_acked(VIRTIO_F_ACCESS_PLATFORM as u64)
+        {
+            self.access_platform.clone()
+        } else {
+            None
+        }
+    }
+
     #[expect(clippy::too_many_arguments)]
     pub fn activate<T: VhostUserFrontendReqHandler>(
         &mut self,
@@ -655,6 +687,7 @@ impl VhostUserCommon {
             .collect::<Vec<_>>();
         let vring_bases = self.vring_bases.take();
 
+        let access_platform = self.access_platform();
         let bounce_handler = if let Some(bstate) = self.bounce.as_ref() {
             let (bounce_kill, bounce_pause) = bounce_evts.ok_or(ActivateError::BadActivate)?;
             let handler = setup_bounce_session(
@@ -667,6 +700,7 @@ impl VhostUserCommon {
                 &backend_req_handler,
                 inflight.as_mut(),
                 vring_bases.as_deref(),
+                access_platform.as_ref(),
                 bounce_kill,
                 bounce_pause,
             )?;

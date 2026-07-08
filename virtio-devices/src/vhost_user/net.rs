@@ -22,6 +22,7 @@ use virtio_queue::QueueT;
 use vm_memory::ByteValued;
 use vm_migration::protocol::MemoryRangeTable;
 use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
+use vm_virtio::AccessPlatform;
 use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::timerfd::TimerFd;
 
@@ -322,6 +323,14 @@ impl VirtioDevice for Net {
 
     fn ack_features(&mut self, value: u64) {
         self.vu_common.virtio_common.ack_features(value);
+    }
+
+    fn set_access_platform(&mut self, access_platform: Arc<dyn AccessPlatform>) {
+        self.vu_common.set_access_platform(access_platform);
+    }
+
+    fn access_platform(&self) -> Option<Arc<dyn AccessPlatform>> {
+        self.vu_common.access_platform()
     }
 
     fn read_config(&self, offset: u64, data: &mut [u8]) {
