@@ -105,11 +105,12 @@ your cue to raise `bounce_pool_size`.
 
 ### Virtio ring features
 
-To keep the shadow ring a faithful mirror of the guest ring, bounce mode
-currently masks `VIRTIO_F_RING_INDIRECT_DESC`, `VIRTIO_F_RING_EVENT_IDX`,
-and `VIRTIO_F_IN_ORDER` from the negotiated feature set. Neither the
-guest nor the daemon sees these bits while bounce is enabled. Support for
-indirect descriptors and event-idx is planned.
+Indirect descriptors (`VIRTIO_F_RING_INDIRECT_DESC`) are supported: an
+indirect chain is re-published to the daemon as a single pool-side
+indirect table, preserving queue depth. Bounce mode currently masks
+`VIRTIO_F_RING_EVENT_IDX` and `VIRTIO_F_IN_ORDER` from the negotiated
+feature set; neither the guest nor the daemon sees those bits while
+bounce is enabled. Event-idx support is planned.
 
 ## How it works
 

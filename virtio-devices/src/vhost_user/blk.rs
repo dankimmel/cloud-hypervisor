@@ -427,10 +427,11 @@ mod tests {
         let bounced = blk_avail_features(4, true);
         // Bounce clears exactly the features mask_bounce_features clears.
         assert_eq!(bounced, mask_bounce_features(plain));
-        // Multi-queue keeps the MQ bit; the ring bits are gone.
+        // Multi-queue keeps the MQ bit; event-idx is masked, but indirect
+        // descriptors remain supported via pool-side tables.
         assert_ne!(bounced & (1 << VIRTIO_BLK_F_MQ), 0);
-        assert_eq!(bounced & (1 << crate::VIRTIO_F_RING_INDIRECT_DESC), 0);
         assert_eq!(bounced & (1 << crate::VIRTIO_F_RING_EVENT_IDX), 0);
+        assert_ne!(bounced & (1 << crate::VIRTIO_F_RING_INDIRECT_DESC), 0);
     }
 
     #[test]

@@ -80,11 +80,46 @@ struct Segment {
 struct InflightChain {
     guest_head: u16,
     segments: Vec<Segment>,
-    /// Shadow descriptor slots used by this chain, head first.
+    /// Shadow descriptor slots used by this chain, head first. For an
+    /// indirect chain this is a single slot (the `F_INDIRECT` head).
     slots: Vec<u16>,
+    /// Pool extent holding the rewritten indirect table, if the chain was
+    /// mirrored via a pool-side indirect table. Freed on completion.
+    table_extent: Option<(GuestAddress, u64)>,
     /// Monotonic submission order, used to re-publish chains in their
     /// original order after a backend reconnect.
     seq: u64,
+}
+
+/// Write a rewritten indirect table into the pool at `table`: one
+/// descriptor per segment, chained with `F_NEXT`, pointing at the pool
+/// buffer extents. Returns false on a pool write error.
+fn write_indirect_table(
+    pool: &BouncePool,
+    table: GuestAddress,
+    descs: &[(GuestAddress, u32, bool)],
+) -> bool {
+    for (i, (addr, len, writable)) in descs.iter().enumerate() {
+        let mut flags = 0u16;
+        if *writable {
+            flags |= VRING_DESC_F_WRITE as u16;
+        }
+        let next = if i + 1 < descs.len() {
+            flags |= VRING_DESC_F_NEXT as u16;
+            (i + 1) as u16
+        } else {
+            0
+        };
+        let d = Descriptor::new(addr.raw_value(), *len, flags, next);
+        if pool
+            .mem()
+            .write_obj(d, table.unchecked_add((i * 16) as u64))
+            .is_err()
+        {
+            return false;
+        }
+    }
+    true
 }
 
 /// Write a chain's descriptors into the shadow descriptor table at
@@ -205,8 +240,21 @@ impl ShadowQueue {
             // Re-write the shadow descriptors (the pool extents still hold
             // this chain's data) and re-publish the avail entry. Pool
             // writes cannot fail for a valid pool.
-            let ok = write_shadow_chain(pool, &self.ring, &chain.slots, &specs);
-            debug_assert!(ok);
+            if let Some((table, _)) = chain.table_extent {
+                let ok = write_indirect_table(pool, table, &specs);
+                debug_assert!(ok);
+                let head_desc = Descriptor::new(
+                    table.raw_value(),
+                    (specs.len() * 16) as u32,
+                    VRING_DESC_F_INDIRECT as u16,
+                    0,
+                );
+                let addr = GuestAddress(self.ring.desc + u64::from(chain.slots[0]) * 16);
+                let _ = pool.mem().write_obj(head_desc, addr);
+            } else {
+                let ok = write_shadow_chain(pool, &self.ring, &chain.slots, &specs);
+                debug_assert!(ok);
+            }
             let pos = idx.0 % self.size;
             let entry = GuestAddress(self.ring.avail + 4 + u64::from(pos) * 2);
             let _ = pool.mem().write_obj(chain.slots[0], entry);
@@ -242,26 +290,24 @@ impl ShadowQueue {
         'chains: while let Some(chain) = guest_q.pop_descriptor_chain(guest_mem) {
             let guest_head = chain.head_index();
 
-            // Detect indirect chains before walking them: virtio-queue's
-            // iterator transparently resolves indirect tables, which the
-            // bounce path does not support (yet).
-            match self.head_flags(guest_mem, guest_q.desc_table(), guest_head) {
-                Ok(flags) if flags & VRING_DESC_F_INDIRECT as u16 != 0 => {
-                    self.mark_broken("chain uses indirect descriptors, unsupported with bounce");
-                    break 'chains;
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    self.mark_broken(&format!("descriptor table inaccessible: {e}"));
-                    break 'chains;
-                }
-            }
+            // virtio-queue's iterator transparently flattens an indirect
+            // table into its buffer descriptors. Detect an indirect head
+            // here so the chain can be re-published as a single pool-side
+            // indirect table (one shadow slot), preserving queue depth.
+            let head_is_indirect =
+                match self.head_flags(guest_mem, guest_q.desc_table(), guest_head) {
+                    Ok(flags) => flags & VRING_DESC_F_INDIRECT as u16 != 0,
+                    Err(e) => {
+                        self.mark_broken(&format!("descriptor table inaccessible: {e}"));
+                        break 'chains;
+                    }
+                };
 
             // Walk the chain. The iterator stops silently on loops,
             // overlong chains and unreadable descriptor tables; in all
             // those cases the last yielded descriptor still claims a
             // successor, which is how they are told apart from a clean
-            // end of chain.
+            // end of chain. Nested indirect tables yield nothing.
             let mut descs: Vec<Descriptor> = Vec::new();
             let mut open_ended = false;
             for desc in chain {
@@ -272,6 +318,12 @@ impl ShadowQueue {
                 self.mark_broken("malformed descriptor chain");
                 break 'chains;
             }
+            // A chain (including a flattened indirect table) may never be
+            // longer than the queue.
+            if descs.len() > usize::from(self.size) {
+                self.mark_broken("descriptor chain longer than the queue");
+                break 'chains;
+            }
             for desc in &descs {
                 if desc.len() != 0 && !guest_mem.check_range(desc.addr(), desc.len() as usize) {
                     self.mark_broken("descriptor buffer outside guest memory");
@@ -279,22 +331,34 @@ impl ShadowQueue {
                 }
             }
 
+            // Pool bytes needed: the device-readable/writable buffers, plus
+            // a table extent for an indirect chain.
+            let table_bytes = if head_is_indirect {
+                (descs.len() * 16) as u64
+            } else {
+                0
+            };
             let needed: u64 = descs
                 .iter()
                 .filter(|d| d.len() != 0)
                 .map(|d| u64::from(d.len()).next_multiple_of(BOUNCE_ALLOC_ALIGN))
-                .sum();
+                .sum::<u64>()
+                + table_bytes.next_multiple_of(BOUNCE_ALLOC_ALIGN);
+            // Shadow slots needed: one for an indirect head, else one per
+            // buffer descriptor.
+            let slots_needed = if head_is_indirect { 1 } else { descs.len() };
 
-            // Reserve shadow descriptor slots and pool extents,
-            // all-or-nothing: on failure roll everything back, rewind the
-            // guest queue cursor and stall until completions free space.
-            if self.free_slots.len() < descs.len() {
+            // Reserve shadow slots and pool extents all-or-nothing: on
+            // failure roll everything back, rewind the guest cursor and
+            // stall until completions free space.
+            if self.free_slots.len() < slots_needed {
                 guest_q.go_to_previous_position();
                 self.enter_stall(needed, pool.buffer_capacity());
                 out.stalled = true;
                 break 'chains;
             }
             let mut extents: Vec<GuestAddress> = Vec::with_capacity(descs.len());
+            let mut stalled = false;
             for desc in &descs {
                 let extent = if desc.len() == 0 {
                     Some(GuestAddress(0))
@@ -304,13 +368,30 @@ impl ShadowQueue {
                 match extent {
                     Some(addr) => extents.push(addr),
                     None => {
-                        self.rollback_extents(pool, &descs, &extents);
-                        guest_q.go_to_previous_position();
-                        self.enter_stall(needed, pool.buffer_capacity());
-                        out.stalled = true;
-                        break 'chains;
+                        stalled = true;
+                        break;
                     }
                 }
+            }
+            // The indirect table extent is part of the same all-or-nothing
+            // reservation.
+            let table_extent = if !stalled && head_is_indirect {
+                match pool.alloc(table_bytes) {
+                    Some(addr) => Some((addr, table_bytes)),
+                    None => {
+                        stalled = true;
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            if stalled {
+                self.rollback_extents(pool, &descs, &extents);
+                guest_q.go_to_previous_position();
+                self.enter_stall(needed, pool.buffer_capacity());
+                out.stalled = true;
+                break 'chains;
             }
 
             // Copy device-readable data into the pool.
@@ -324,29 +405,51 @@ impl ShadowQueue {
                     desc.len(),
                 ) {
                     self.rollback_extents(pool, &descs, &extents);
+                    if let Some((addr, len)) = table_extent {
+                        let _ = pool.free(addr, len);
+                    }
                     self.mark_broken(&format!("guest buffer copy failed: {e}"));
                     break 'chains;
                 }
             }
 
-            // Write the rewritten chain into the shadow descriptor table.
-            let count = descs.len();
-            let mut slots = Vec::with_capacity(count);
-            for _ in 0..count {
-                // Availability was checked above.
-                slots.push(self.free_slots.pop().unwrap());
-            }
             let specs: Vec<(GuestAddress, u32, bool)> = descs
                 .iter()
                 .zip(&extents)
                 .map(|(d, a)| (*a, d.len(), d.is_write_only()))
                 .collect();
-            // Writes into the pool cannot fail (fixed, mapped, in bounds);
-            // treat failure as an internal error.
-            if !write_shadow_chain(pool, &self.ring, &slots, &specs) {
-                self.mark_broken("shadow descriptor write failed");
-                break 'chains;
-            }
+
+            // Write the shadow descriptors. Writes into the pool cannot
+            // fail for a valid pool; treat failure as an internal error.
+            let slots = if let Some((table, _)) = table_extent {
+                if !write_indirect_table(pool, table, &specs) {
+                    self.mark_broken("indirect table write failed");
+                    break 'chains;
+                }
+                let slot = self.free_slots.pop().unwrap();
+                let head_desc = Descriptor::new(
+                    table.raw_value(),
+                    (descs.len() * 16) as u32,
+                    VRING_DESC_F_INDIRECT as u16,
+                    0,
+                );
+                let addr = GuestAddress(self.ring.desc + u64::from(slot) * 16);
+                if pool.mem().write_obj(head_desc, addr).is_err() {
+                    self.mark_broken("shadow indirect head write failed");
+                    break 'chains;
+                }
+                vec![slot]
+            } else {
+                let mut slots = Vec::with_capacity(descs.len());
+                for _ in 0..descs.len() {
+                    slots.push(self.free_slots.pop().unwrap());
+                }
+                if !write_shadow_chain(pool, &self.ring, &slots, &specs) {
+                    self.mark_broken("shadow descriptor write failed");
+                    break 'chains;
+                }
+                slots
+            };
 
             // Publish the avail entry (the index store below makes the
             // whole batch visible to the backend).
@@ -376,6 +479,7 @@ impl ShadowQueue {
                 guest_head,
                 segments,
                 slots,
+                table_extent,
                 seq,
             });
             self.inflight_count += 1;
@@ -588,6 +692,10 @@ impl ShadowQueue {
                 let res = pool.free(seg.pool_addr, u64::from(seg.len));
                 debug_assert!(res.is_ok());
             }
+        }
+        if let Some((addr, len)) = chain.table_extent {
+            let res = pool.free(addr, len);
+            debug_assert!(res.is_ok());
         }
         self.free_slots.extend_from_slice(&chain.slots);
     }
@@ -869,31 +977,32 @@ mod tests {
     }
 
     #[test]
-    fn mirror_indirect_flag_marks_queue_broken() {
+    fn mirror_nested_indirect_marks_queue_broken() {
+        // An indirect table whose entry is itself F_INDIRECT is illegal;
+        // virtio-queue yields nothing, so the chain is malformed/broken.
         let mut h = harness(8, 8192);
-        let table = h.ring.alloc_buf(64);
+        let inner = h.ring.alloc_buf(64);
+        let table = h.ring.alloc_buf(16);
+        // Table entry with F_INDIRECT set (nested).
         h.ring
-            .desc(&h.mem, 0, table, 16, VRING_DESC_F_INDIRECT as u16, 0);
-        h.ring.publish(&h.mem, 0);
-        assert_eq!(
-            mirror(&mut h),
-            MirrorOutcome {
-                chains: 0,
-                stalled: false
-            }
-        );
-        assert!(h.sq.is_broken());
-        // Broken queues consume nothing further.
-        let buf = h.ring.alloc_buf(64);
-        let head = h.ring.chain(&h.mem, &[(buf, 64, false)]);
-        h.ring.publish(&h.mem, head);
+            .desc(&h.mem, 0, inner, 16, VRING_DESC_F_INDIRECT as u16, 0);
+        // Reuse desc() to write the nested entry into the table region.
+        h.mem
+            .write_obj(
+                Descriptor::new(inner, 16, VRING_DESC_F_INDIRECT as u16, 0),
+                GuestAddress(table),
+            )
+            .unwrap();
+        h.ring
+            .desc(&h.mem, 1, table, 16, VRING_DESC_F_INDIRECT as u16, 0);
+        h.ring.publish(&h.mem, 1);
         assert_eq!(mirror(&mut h).chains, 0);
+        assert!(h.sq.is_broken());
     }
 
     // ---- Indirect descriptors (plan commit 27) ----
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 27"]
     fn indirect_chain_mirrored_via_pool_indirect_table() {
         let mut h = harness(8, 8192);
         let (a, b) = (h.ring.alloc_buf(0x100), h.ring.alloc_buf(0x40));
@@ -922,7 +1031,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 27"]
     fn indirect_chain_consumes_one_shadow_slot() {
         // queue_size indirect chains of 4 segments each can all be in
         // flight at once: each consumes exactly one shadow slot.
@@ -941,7 +1049,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 27"]
     fn indirect_writable_entries_copy_back() {
         let mut h = harness(8, 8192);
         let (req, resp) = (h.ring.alloc_buf(32), h.ring.alloc_buf(128));
@@ -957,7 +1064,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 27"]
     fn indirect_table_extent_freed_and_scrubbed_on_completion() {
         let mut h = harness(8, 8192);
         let buf = h.ring.alloc_buf(64);
@@ -966,7 +1072,7 @@ mod tests {
         assert_eq!(mirror(&mut h).chains, 1);
         let shadow_head = h.daemon.pop_avail(&h.pool, 0);
         let table_addr = h.daemon.read_desc(&h.pool, 0, shadow_head).addr();
-        h.daemon.serve_one(&h.pool, 0, 1);
+        h.daemon.complete(&h.pool, 0, shadow_head, 64);
         assert_eq!(complete(&mut h).chains, 1);
         // The pool-side table extent is freed and scrubbed.
         assert_eq!(h.pool.free_bytes(), h.pool.buffer_capacity());
@@ -977,7 +1083,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 27"]
     fn indirect_table_longer_than_queue_size_marks_broken() {
         let mut h = harness(4, 1 << 20);
         // 5 entries in a queue of size 4.
@@ -991,7 +1096,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 27"]
     fn indirect_allocation_failure_stalls_atomically() {
         // A tiny arena cannot fit the buffers + table; the whole chain
         // rolls back and stalls, leaving the pool untouched.
