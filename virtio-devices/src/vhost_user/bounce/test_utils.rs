@@ -199,6 +199,48 @@ impl GuestRingBuilder {
         head
     }
 
+    /// Like [`Self::indirect_chain`], but models a guest behind a vIOMMU:
+    /// the table is stored at its GPA, yet the head descriptor points at
+    /// `table_gpa + iova_offset` and each entry's buffer address is
+    /// `seg_gpa + iova_offset`. A correct mirror must translate the table
+    /// pointer (to read the table) and each entry address. Returns the
+    /// head slot.
+    pub(crate) fn indirect_chain_iova(
+        &mut self,
+        mem: &GuestMemoryMmap,
+        segs: &[(u64, u32, bool)],
+        iova_offset: u64,
+    ) -> u16 {
+        use virtio_bindings::virtio_ring::{
+            VRING_DESC_F_INDIRECT, VRING_DESC_F_NEXT, VRING_DESC_F_WRITE,
+        };
+        assert!(!segs.is_empty());
+        let table = self.alloc_buf((segs.len() * 16) as u32);
+        for (i, (addr, len, writable)) in segs.iter().enumerate() {
+            let mut flags = 0u16;
+            if *writable {
+                flags |= VRING_DESC_F_WRITE as u16;
+            }
+            if i + 1 < segs.len() {
+                flags |= VRING_DESC_F_NEXT as u16;
+            }
+            let entry = Descriptor::new(addr + iova_offset, *len, flags, (i + 1) as u16);
+            mem.write_obj(entry, GuestAddress(table + (i * 16) as u64))
+                .unwrap();
+        }
+        let head = self.next_desc;
+        self.next_desc = (self.next_desc + 1) % self.queue_size;
+        self.desc(
+            mem,
+            head,
+            table + iova_offset,
+            (segs.len() * 16) as u32,
+            VRING_DESC_F_INDIRECT as u16,
+            0,
+        );
+        head
+    }
+
     /// Publish `head` in the avail ring and bump the avail index.
     pub(crate) fn publish(&mut self, mem: &GuestMemoryMmap, head: u16) {
         let pos = self.avail_idx % self.queue_size;

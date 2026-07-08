@@ -1323,6 +1323,87 @@ mod tests {
         assert_eq!(h.pool.free_bytes(), h.pool.buffer_capacity());
     }
 
+    // ---- Translated indirect walk (plan commit 33) ----
+
+    #[test]
+    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 33"]
+    fn indirect_table_pointer_is_translated() {
+        // The head descriptor's table pointer is an IOVA outside guest RAM.
+        // A correct walk must translate it to read the table at all; without
+        // translation virtio-queue reads garbage and the chain is rejected.
+        let mut h = harness(8, 8192);
+        h.sq.set_access_platform(Some(Arc::new(OffsetTranslator {
+            offset: TEST_IOVA_OFFSET,
+        })));
+        let gpa = h.ring.alloc_buf(128);
+        fill(&h.mem, gpa, 128, 0x5a);
+        let head = h
+            .ring
+            .indirect_chain_iova(&h.mem, &[(gpa, 128, false)], TEST_IOVA_OFFSET);
+        h.ring.publish(&h.mem, head);
+        assert_eq!(mirror(&mut h).chains, 1);
+
+        let shadow_head = h.daemon.pop_avail(&h.pool, 0);
+        let chain = h.daemon.read_chain(&h.pool, 0, shadow_head);
+        assert_eq!(
+            read_back(h.pool.mem(), chain[0].addr().raw_value(), 128),
+            vec![0x5a; 128]
+        );
+    }
+
+    #[test]
+    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 33"]
+    fn indirect_entry_addresses_are_translated() {
+        // A two-segment indirect chain: both entry buffer addresses are
+        // IOVAs and must be translated for copy-in and copy-back.
+        let mut h = harness(8, 8192);
+        h.sq.set_access_platform(Some(Arc::new(OffsetTranslator {
+            offset: TEST_IOVA_OFFSET,
+        })));
+        let (req, resp) = (h.ring.alloc_buf(64), h.ring.alloc_buf(64));
+        fill(&h.mem, req, 64, 0x11);
+        fill(&h.mem, resp, 64, 0x00);
+        let head = h.ring.indirect_chain_iova(
+            &h.mem,
+            &[(req, 64, false), (resp, 64, true)],
+            TEST_IOVA_OFFSET,
+        );
+        h.ring.publish(&h.mem, head);
+        assert_eq!(mirror(&mut h).chains, 1);
+
+        let shadow_head = h.daemon.pop_avail(&h.pool, 0);
+        let chain = h.daemon.read_chain(&h.pool, 0, shadow_head);
+        // Readable segment was copied in from the translated GPA.
+        assert_eq!(
+            read_back(h.pool.mem(), chain[0].addr().raw_value(), 64),
+            vec![0x11; 64]
+        );
+        // Stage a device write into the pool, then complete: the writable
+        // segment must copy back to the translated GPA.
+        h.pool
+            .mem()
+            .write_slice(&[0x99; 64], chain[1].addr())
+            .unwrap();
+        h.daemon.complete(&h.pool, 0, shadow_head, 64);
+        assert_eq!(complete(&mut h).chains, 1);
+        assert_eq!(read_back(&h.mem, resp, 64), vec![0x99; 64]);
+    }
+
+    #[test]
+    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 33"]
+    fn indirect_table_translation_failure_marks_broken() {
+        let mut h = harness(8, 8192);
+        h.sq.set_access_platform(Some(Arc::new(FailingTranslator)));
+        let gpa = h.ring.alloc_buf(64);
+        let head = h
+            .ring
+            .indirect_chain_iova(&h.mem, &[(gpa, 64, false)], TEST_IOVA_OFFSET);
+        h.ring.publish(&h.mem, head);
+        assert_eq!(mirror(&mut h).chains, 0);
+        assert!(h.sq.is_broken());
+        assert_eq!(h.pool.free_bytes(), h.pool.buffer_capacity());
+    }
+
     #[test]
     fn mirror_chain_longer_than_queue_marks_queue_broken() {
         let mut h = harness(4, 8192);
