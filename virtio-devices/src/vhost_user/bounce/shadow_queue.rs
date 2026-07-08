@@ -890,6 +890,124 @@ mod tests {
         assert_eq!(mirror(&mut h).chains, 0);
     }
 
+    // ---- Indirect descriptors (plan commit 27) ----
+
+    #[test]
+    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 27"]
+    fn indirect_chain_mirrored_via_pool_indirect_table() {
+        let mut h = harness(8, 8192);
+        let (a, b) = (h.ring.alloc_buf(0x100), h.ring.alloc_buf(0x40));
+        fill(&h.mem, a, 0x100, 0x5a);
+        let head = h
+            .ring
+            .indirect_chain(&h.mem, &[(a, 0x100, false), (b, 0x40, true)]);
+        h.ring.publish(&h.mem, head);
+        assert_eq!(mirror(&mut h).chains, 1);
+
+        let shadow_head = h.daemon.pop_avail(&h.pool, 0);
+        // The single shadow descriptor is F_INDIRECT into the pool.
+        let shadow_desc = h.daemon.read_desc(&h.pool, 0, shadow_head);
+        assert!(shadow_desc.refers_to_indirect_table());
+        assert!(shadow_desc.addr().raw_value() >= h.pool.arena_base());
+        // Resolving it yields the two rewritten buffer descriptors.
+        let chain = h.daemon.read_chain(&h.pool, 0, shadow_head);
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain[0].len(), 0x100);
+        assert!(!chain[0].is_write_only());
+        assert!(chain[1].is_write_only());
+        assert_eq!(
+            read_back(h.pool.mem(), chain[0].addr().raw_value(), 0x100),
+            vec![0x5a; 0x100]
+        );
+    }
+
+    #[test]
+    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 27"]
+    fn indirect_chain_consumes_one_shadow_slot() {
+        // queue_size indirect chains of 4 segments each can all be in
+        // flight at once: each consumes exactly one shadow slot.
+        let mut h = harness(4, 1 << 20);
+        for _ in 0..4 {
+            let segs: Vec<(u64, u32, bool)> = (0..4)
+                .map(|_| (h.ring.alloc_buf(64), 64u32, true))
+                .collect();
+            let head = h.ring.indirect_chain(&h.mem, &segs);
+            h.ring.publish(&h.mem, head);
+        }
+        let out = mirror(&mut h);
+        assert_eq!(out.chains, 4);
+        assert!(!out.stalled);
+        assert_eq!(h.sq.inflight_count(), 4);
+    }
+
+    #[test]
+    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 27"]
+    fn indirect_writable_entries_copy_back() {
+        let mut h = harness(8, 8192);
+        let (req, resp) = (h.ring.alloc_buf(32), h.ring.alloc_buf(128));
+        let head = h
+            .ring
+            .indirect_chain(&h.mem, &[(req, 32, false), (resp, 128, true)]);
+        h.ring.publish(&h.mem, head);
+        assert_eq!(mirror(&mut h).chains, 1);
+        h.daemon.serve_one(&h.pool, 0, 0x66);
+        assert_eq!(complete(&mut h).chains, 1);
+        assert_eq!(read_back(&h.mem, resp, 128), vec![0x66; 128]);
+        assert_eq!(h.ring.used_elem(&h.mem, 0), (u32::from(head), 128));
+    }
+
+    #[test]
+    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 27"]
+    fn indirect_table_extent_freed_and_scrubbed_on_completion() {
+        let mut h = harness(8, 8192);
+        let buf = h.ring.alloc_buf(64);
+        let head = h.ring.indirect_chain(&h.mem, &[(buf, 64, true)]);
+        h.ring.publish(&h.mem, head);
+        assert_eq!(mirror(&mut h).chains, 1);
+        let shadow_head = h.daemon.pop_avail(&h.pool, 0);
+        let table_addr = h.daemon.read_desc(&h.pool, 0, shadow_head).addr();
+        h.daemon.serve_one(&h.pool, 0, 1);
+        assert_eq!(complete(&mut h).chains, 1);
+        // The pool-side table extent is freed and scrubbed.
+        assert_eq!(h.pool.free_bytes(), h.pool.buffer_capacity());
+        assert_eq!(
+            read_back(h.pool.mem(), table_addr.raw_value(), 16),
+            vec![0u8; 16]
+        );
+    }
+
+    #[test]
+    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 27"]
+    fn indirect_table_longer_than_queue_size_marks_broken() {
+        let mut h = harness(4, 1 << 20);
+        // 5 entries in a queue of size 4.
+        let segs: Vec<(u64, u32, bool)> = (0..5)
+            .map(|_| (h.ring.alloc_buf(16), 16u32, false))
+            .collect();
+        let head = h.ring.indirect_chain(&h.mem, &segs);
+        h.ring.publish(&h.mem, head);
+        assert_eq!(mirror(&mut h).chains, 0);
+        assert!(h.sq.is_broken());
+    }
+
+    #[test]
+    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 27"]
+    fn indirect_allocation_failure_stalls_atomically() {
+        // A tiny arena cannot fit the buffers + table; the whole chain
+        // rolls back and stalls, leaving the pool untouched.
+        let mut h = harness(8, 128);
+        let (a, b) = (h.ring.alloc_buf(96), h.ring.alloc_buf(96));
+        let head = h
+            .ring
+            .indirect_chain(&h.mem, &[(a, 96, false), (b, 96, false)]);
+        h.ring.publish(&h.mem, head);
+        let out = mirror(&mut h);
+        assert!(out.stalled);
+        assert_eq!(out.chains, 0);
+        assert_eq!(h.pool.free_bytes(), h.pool.buffer_capacity());
+        assert_eq!(h.sq.inflight_count(), 0);
+    }
+
     #[test]
     fn mirror_chain_longer_than_queue_marks_queue_broken() {
         let mut h = harness(4, 8192);

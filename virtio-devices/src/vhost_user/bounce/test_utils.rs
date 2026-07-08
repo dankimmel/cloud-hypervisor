@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use virtio_queue::desc::split::Descriptor;
 use virtio_queue::{Queue, QueueT};
-use vm_memory::{Bytes, GuestAddress};
+use vm_memory::{Address, Bytes, GuestAddress};
 use vmm_sys_util::eventfd::EventFd;
 
 use super::pool::BouncePool;
@@ -138,6 +138,46 @@ impl GuestRingBuilder {
         head
     }
 
+    /// Build an indirect descriptor chain: an indirect table laid out in
+    /// guest memory holding one entry per segment, and a single head
+    /// descriptor with `F_INDIRECT` pointing at it. Returns the head slot.
+    pub(crate) fn indirect_chain(
+        &mut self,
+        mem: &GuestMemoryMmap,
+        segs: &[(u64, u32, bool)],
+    ) -> u16 {
+        use virtio_bindings::virtio_ring::{
+            VRING_DESC_F_INDIRECT, VRING_DESC_F_NEXT, VRING_DESC_F_WRITE,
+        };
+        assert!(!segs.is_empty());
+        // Reserve guest space for the indirect table (16 bytes/entry).
+        let table = self.alloc_buf((segs.len() * 16) as u32);
+        for (i, (addr, len, writable)) in segs.iter().enumerate() {
+            let mut flags = 0u16;
+            if *writable {
+                flags |= VRING_DESC_F_WRITE as u16;
+            }
+            if i + 1 < segs.len() {
+                flags |= VRING_DESC_F_NEXT as u16;
+            }
+            let entry = Descriptor::new(*addr, *len, flags, (i + 1) as u16);
+            mem.write_obj(entry, GuestAddress(table + (i * 16) as u64))
+                .unwrap();
+        }
+        // Single head descriptor referencing the table.
+        let head = self.next_desc;
+        self.next_desc = (self.next_desc + 1) % self.queue_size;
+        self.desc(
+            mem,
+            head,
+            table,
+            (segs.len() * 16) as u32,
+            VRING_DESC_F_INDIRECT as u16,
+            0,
+        );
+        head
+    }
+
     /// Publish `head` in the avail ring and bump the avail index.
     pub(crate) fn publish(&mut self, mem: &GuestMemoryMmap, head: u16) {
         let pos = self.avail_idx % self.queue_size;
@@ -237,8 +277,29 @@ impl FakeDaemon {
             .unwrap()
     }
 
-    /// Follow a shadow descriptor chain starting at `head`.
+    /// Follow a shadow descriptor chain starting at `head`, resolving a
+    /// pool-side indirect table (a single `F_INDIRECT` head descriptor)
+    /// the way a real backend would.
     pub(crate) fn read_chain(&self, pool: &BouncePool, q: usize, head: u16) -> Vec<Descriptor> {
+        use virtio_bindings::virtio_ring::VRING_DESC_F_INDIRECT;
+        let head_desc = self.read_desc(pool, q, head);
+        if head_desc.flags() & VRING_DESC_F_INDIRECT as u16 != 0 {
+            // Walk the indirect table at the head's pool address.
+            let count = head_desc.len() as usize / 16;
+            let mut descs = Vec::with_capacity(count);
+            for i in 0..count {
+                let entry: Descriptor = pool
+                    .mem()
+                    .read_obj(head_desc.addr().unchecked_add((i * 16) as u64))
+                    .unwrap();
+                let last = !entry.has_next();
+                descs.push(entry);
+                if last {
+                    break;
+                }
+            }
+            return descs;
+        }
         let mut descs = Vec::new();
         let mut slot = head;
         loop {
