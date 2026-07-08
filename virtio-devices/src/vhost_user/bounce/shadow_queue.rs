@@ -532,6 +532,13 @@ impl ShadowQueue {
         self.inflight_count
     }
 
+    /// True when no chain is in flight, i.e. every request handed to the
+    /// backend has been copied back to the guest. A snapshot is only
+    /// consistent once every queue reports drained.
+    pub fn verify_drained(&self) -> bool {
+        todo!("implemented in docs/vhost-user-bounce-plan.md commit 23")
+    }
+
     /// A spec violation was detected; the queue no longer processes
     /// anything (until device reset).
     pub fn is_broken(&self) -> bool {
@@ -1227,6 +1234,84 @@ mod tests {
         assert_eq!(complete(&mut h).chains, 1);
         assert_eq!(h.ring.used_idx(&h.mem), 4);
         assert_eq!(h.sq.inflight_count(), 0);
+    }
+
+    // ---- Restore priming (plan commit 23) ----
+
+    #[test]
+    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 23"]
+    fn verify_drained_reflects_inflight() {
+        let mut h = harness(8, 8192);
+        assert!(h.sq.verify_drained());
+        let buf = h.ring.alloc_buf(64);
+        let head = h.ring.chain(&h.mem, &[(buf, 64, true)]);
+        h.ring.publish(&h.mem, head);
+        assert_eq!(mirror(&mut h).chains, 1);
+        assert!(!h.sq.verify_drained());
+        h.daemon.serve_one(&h.pool, 0, 1);
+        assert_eq!(complete(&mut h).chains, 1);
+        assert!(h.sq.verify_drained());
+    }
+
+    #[test]
+    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 23"]
+    fn restore_mirror_between_base_and_avail_idx() {
+        // A queue restored with avail idx 5, used idx 3, backend base 3
+        // must mirror exactly the two chains 3 and 4 on the first sweep.
+        let mut h = harness(8, 8192);
+        h.ring.set_start(&h.mem, 3);
+        // Publish two chains, advancing avail idx from 3 to 5.
+        let mut heads = Vec::new();
+        for _ in 0..2 {
+            let buf = h.ring.alloc_buf(64);
+            let head = h.ring.chain(&h.mem, &[(buf, 64, true)]);
+            h.ring.publish(&h.mem, head);
+            heads.push(head);
+        }
+        h.q = h.ring.queue();
+        h.sq.reset_session(3);
+        h.daemon = FakeDaemon::new(1, 8);
+        h.daemon.set_start(0, 3);
+
+        let out = mirror(&mut h);
+        assert_eq!(out.chains, 2);
+        assert_eq!(h.daemon.avail_idx(&h.pool, 0), 5);
+        assert!(!h.sq.verify_drained());
+    }
+
+    #[test]
+    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 23"]
+    fn restore_base_equal_avail_idx_is_noop() {
+        let mut h = harness(8, 8192);
+        h.ring.set_start(&h.mem, 7);
+        h.q = h.ring.queue();
+        h.sq.reset_session(7);
+        h.daemon = FakeDaemon::new(1, 8);
+        h.daemon.set_start(0, 7);
+        // Nothing published since the base, so the sweep mirrors nothing.
+        assert_eq!(mirror(&mut h).chains, 0);
+        assert!(h.sq.verify_drained());
+    }
+
+    #[test]
+    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 23"]
+    fn restore_with_wrapped_indices() {
+        // Base near u16::MAX so the restored indices wrap during mirroring.
+        let base = u16::MAX - 1;
+        let mut h = harness(8, 8192);
+        h.ring.set_start(&h.mem, base);
+        for _ in 0..3 {
+            let buf = h.ring.alloc_buf(64);
+            let head = h.ring.chain(&h.mem, &[(buf, 64, true)]);
+            h.ring.publish(&h.mem, head);
+        }
+        h.q = h.ring.queue();
+        h.sq.reset_session(base);
+        h.daemon = FakeDaemon::new(1, 8);
+        h.daemon.set_start(0, base);
+        assert_eq!(mirror(&mut h).chains, 3);
+        // base + 3 wraps past u16::MAX to 1.
+        assert_eq!(h.daemon.avail_idx(&h.pool, 0), base.wrapping_add(3));
     }
 
     #[test]

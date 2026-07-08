@@ -12,7 +12,7 @@
 //! consistent (see `docs/vhost-user-bounce-plan.md` §2.5-2.6).
 
 use std::os::unix::io::AsRawFd;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -55,6 +55,10 @@ pub struct BounceEpollHandler {
     pub kill_evt: EventFd,
     pub pause_evt: EventFd,
     pub drain_timeout: Duration,
+    /// Device-level count of chains owned by the backend, published so
+    /// snapshotting can refuse while requests are in flight. Maintained
+    /// by the mirror/complete paths in the next commit.
+    pub inflight_total: Arc<AtomicUsize>,
 }
 
 /// First epoll token used by the worker for its per-queue events.
@@ -222,6 +226,8 @@ mod tests {
         pause_evt: EventFd,
         paused: Arc<AtomicBool>,
         paused_sync: Arc<Barrier>,
+        inflight_total: Arc<AtomicUsize>,
+        drain_timeout: Duration,
         handle: Option<thread::JoinHandle<()>>,
     }
 
@@ -263,6 +269,8 @@ mod tests {
             pause_evt: EventFd::new(libc::EFD_NONBLOCK).unwrap(),
             paused: Arc::new(AtomicBool::new(false)),
             paused_sync: Arc::new(Barrier::new(2)),
+            inflight_total: Arc::new(AtomicUsize::new(0)),
+            drain_timeout: TIMEOUT,
             handle: None,
         }
     }
@@ -294,7 +302,8 @@ mod tests {
                 interrupt: self.interrupt.clone(),
                 kill_evt: self.kill_evt.try_clone().unwrap(),
                 pause_evt: self.pause_evt.try_clone().unwrap(),
-                drain_timeout: TIMEOUT,
+                drain_timeout: self.drain_timeout,
+                inflight_total: self.inflight_total.clone(),
             };
             let paused = self.paused.clone();
             let paused_sync = self.paused_sync.clone();
@@ -489,5 +498,106 @@ mod tests {
             assert!(h.wait_backend_kick(q), "queue {q} not kicked");
         }
         h.stop();
+    }
+
+    // ---- Restore priming & inflight tracking (plan commit 23) ----
+
+    #[test]
+    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 23"]
+    fn worker_tracks_inflight_total() {
+        let mut h = build(1, 8, 8192);
+        h.start();
+        let resp = h.rings[0].alloc_buf(64);
+        let head = h.rings[0].chain(&h.mem, &[(resp, 64, true)]);
+        h.rings[0].publish(&h.mem, head);
+        h.kick_guest(0);
+        assert!(h.wait_backend_kick(0));
+
+        // After mirroring, the device-level counter reflects the in-flight
+        // chain, so a snapshot taken now would be refused.
+        assert!(
+            wait_value(&h.inflight_total, 1, TIMEOUT),
+            "inflight not counted"
+        );
+
+        {
+            let guard = h.shared.lock().unwrap();
+            h.daemon.serve_one(&guard.pool, 0, 0x33);
+        }
+        h.signal_backend_call(0);
+        assert!(h.interrupt.wait_interrupt(0, TIMEOUT));
+        assert!(
+            wait_value(&h.inflight_total, 0, TIMEOUT),
+            "inflight not cleared on completion"
+        );
+        h.stop();
+    }
+
+    #[test]
+    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 23"]
+    fn pause_drains_to_zero_inflight() {
+        let mut h = build(1, 8, 8192);
+        h.start();
+        let resp = h.rings[0].alloc_buf(64);
+        let head = h.rings[0].chain(&h.mem, &[(resp, 64, true)]);
+        h.rings[0].publish(&h.mem, head);
+        h.kick_guest(0);
+        assert!(h.wait_backend_kick(0));
+
+        // Backend completes but does not signal; the pause drain must both
+        // flush it back to the guest and zero the in-flight counter so a
+        // subsequent snapshot is allowed.
+        {
+            let guard = h.shared.lock().unwrap();
+            h.daemon.serve_one(&guard.pool, 0, 0x44);
+        }
+        h.paused.store(true, Ordering::SeqCst);
+        h.pause_evt.write(1).unwrap();
+        h.paused_sync.wait();
+        assert_eq!(h.inflight_total.load(Ordering::SeqCst), 0);
+        assert_eq!(read_guest(&h.mem, resp, 64), vec![0x44; 64]);
+
+        h.paused.store(false, Ordering::SeqCst);
+        h.handle.as_ref().unwrap().thread().unpark();
+        h.stop();
+    }
+
+    #[test]
+    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 23"]
+    fn pause_with_wedged_daemon_times_out() {
+        // A backend that never completes must not block pause forever; the
+        // drain gives up after the (short, test-tuned) timeout, leaving the
+        // in-flight counter nonzero so a snapshot would be refused.
+        let mut h = build(1, 8, 8192);
+        h.drain_timeout = Duration::from_millis(50);
+        h.start();
+        let resp = h.rings[0].alloc_buf(64);
+        let head = h.rings[0].chain(&h.mem, &[(resp, 64, true)]);
+        h.rings[0].publish(&h.mem, head);
+        h.kick_guest(0);
+        assert!(h.wait_backend_kick(0));
+        assert!(wait_value(&h.inflight_total, 1, TIMEOUT));
+
+        // Do not complete anything. Pause must still return.
+        h.paused.store(true, Ordering::SeqCst);
+        h.pause_evt.write(1).unwrap();
+        h.paused_sync.wait();
+        assert_eq!(h.inflight_total.load(Ordering::SeqCst), 1);
+
+        h.paused.store(false, Ordering::SeqCst);
+        h.handle.as_ref().unwrap().thread().unpark();
+        h.stop();
+    }
+
+    /// Wait up to `timeout` for an atomic counter to reach `want`.
+    fn wait_value(v: &Arc<AtomicUsize>, want: usize, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if v.load(Ordering::SeqCst) == want {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        v.load(Ordering::SeqCst) == want
     }
 }

@@ -567,6 +567,7 @@ fn setup_bounce_session<T: VhostUserFrontendReqHandler>(
         kill_evt: bounce_kill,
         pause_evt: bounce_pause,
         drain_timeout: bounce::worker::BOUNCE_DRAIN_TIMEOUT,
+        inflight_total: bstate.inflight_total.clone(),
     })
 }
 
