@@ -84,13 +84,14 @@ impl BounceState {
     }
 }
 
-/// Clear the virtio ring features that bounce mode does not (yet)
-/// support, so neither the guest nor the backend ever negotiates them.
-/// Applied to a device's available features before feature negotiation.
-/// Indirect descriptors are supported (via pool-side indirect tables) and
-/// so are left enabled.
+/// Clear the virtio ring features that bounce mode does not support, so
+/// neither the guest nor the backend ever negotiates them. Applied to a
+/// device's available features before feature negotiation. Indirect
+/// descriptors (via pool-side indirect tables) and event-idx (the worker
+/// manages both the guest and shadow event fields) are supported and so
+/// are left enabled.
 pub fn mask_bounce_features(avail_features: u64) -> u64 {
-    avail_features & !(1 << crate::VIRTIO_F_RING_EVENT_IDX) & !(1 << crate::VIRTIO_F_IN_ORDER)
+    avail_features & !(1 << crate::VIRTIO_F_IN_ORDER)
 }
 
 /// The eventfds wiring one shadow queue to the backend: the VMM kicks
@@ -164,25 +165,27 @@ mod tests {
     }
 
     #[test]
-    fn mask_bounce_features_clears_event_idx_and_in_order() {
-        let all = (1 << crate::VIRTIO_F_RING_EVENT_IDX) | (1 << crate::VIRTIO_F_IN_ORDER);
-        assert_eq!(mask_bounce_features(all), 0);
+    fn mask_bounce_features_clears_in_order() {
+        let in_order = 1 << crate::VIRTIO_F_IN_ORDER;
+        assert_eq!(mask_bounce_features(in_order), 0);
     }
 
     #[test]
-    fn mask_bounce_features_keeps_indirect() {
-        // Indirect descriptors are supported via pool-side tables, so the
-        // bit survives masking.
+    fn mask_bounce_features_keeps_indirect_and_event_idx() {
+        // Indirect descriptors (pool-side tables) and event-idx (the worker
+        // manages both event fields) are supported, so both bits survive.
         let indirect = 1 << crate::VIRTIO_F_RING_INDIRECT_DESC;
-        assert_eq!(mask_bounce_features(indirect), indirect);
+        let event_idx = 1 << crate::VIRTIO_F_RING_EVENT_IDX;
+        assert_eq!(
+            mask_bounce_features(indirect | event_idx),
+            indirect | event_idx
+        );
     }
 
     #[test]
     fn mask_bounce_features_preserves_other_bits() {
         let masked = mask_bounce_features(super::super::DEFAULT_VIRTIO_FEATURES);
-        let expected = super::super::DEFAULT_VIRTIO_FEATURES
-            & !(1 << crate::VIRTIO_F_RING_EVENT_IDX)
-            & !(1 << crate::VIRTIO_F_IN_ORDER);
+        let expected = super::super::DEFAULT_VIRTIO_FEATURES & !(1 << crate::VIRTIO_F_IN_ORDER);
         assert_eq!(masked, expected);
     }
 

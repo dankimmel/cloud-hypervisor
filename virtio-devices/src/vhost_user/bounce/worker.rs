@@ -11,6 +11,7 @@
 //! drains outstanding completions so the device parks with guest memory
 //! consistent (see `docs/vhost-user-bounce-plan.md` §2.5-2.6).
 
+use std::ops::Deref;
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
@@ -18,6 +19,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use log::error;
+use virtio_queue::QueueT;
 use vm_memory::{GuestAddressSpace, GuestMemoryAtomic};
 use vmm_sys_util::eventfd::EventFd;
 
@@ -135,14 +137,27 @@ impl BounceEpollHandler {
     /// and kick the backend if anything was published.
     fn mirror_and_kick(&mut self, i: usize) {
         let mem = self.guest_mem.memory();
-        let mut guard = self.shared.lock().unwrap();
-        let BounceShared { pool, shadow } = &mut *guard;
-        let outcome = shadow[i].mirror_avail(&mem, &mut self.queues[i].1, pool);
-        drop(guard);
-        if outcome.chains > 0 {
-            self.inflight_total
-                .fetch_add(outcome.chains, Ordering::Relaxed);
-            let _ = self.fds[i].shadow_kick.write(1);
+        loop {
+            let mut guard = self.shared.lock().unwrap();
+            let BounceShared { pool, shadow } = &mut *guard;
+            let outcome = shadow[i].mirror_avail(&mem, &mut self.queues[i].1, pool);
+            drop(guard);
+            if outcome.chains > 0 {
+                self.inflight_total
+                    .fetch_add(outcome.chains, Ordering::Relaxed);
+                let _ = self.fds[i].shadow_kick.write(1);
+            }
+            // Keep the guest kicking (event-idx keeps avail_event current;
+            // without it this just re-enables notifications). A `true`
+            // return means the guest added entries during the window, so
+            // mirror them now to avoid a lost kick.
+            let more = self.queues[i]
+                .1
+                .enable_notification(mem.deref())
+                .unwrap_or(false);
+            if outcome.stalled || !more {
+                break;
+            }
         }
     }
 
@@ -646,7 +661,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 29"]
     fn avail_event_kept_current_so_guest_always_kicks() {
         // With the guest using event-idx, the worker must keep the
         // device-written avail_event at the current avail index so the

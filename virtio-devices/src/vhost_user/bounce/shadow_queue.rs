@@ -500,6 +500,8 @@ impl ShadowQueue {
             {
                 self.mark_broken("shadow avail index store failed");
             }
+            // Keep the backend notifying for completions of these chains.
+            self.arm_backend_calls(pool);
         }
         out
     }
@@ -600,87 +602,115 @@ impl ShadowQueue {
         }
 
         let idx_addr = GuestAddress(self.ring.used + 2);
-        let Ok(shadow_used_idx) = pool.mem().load::<u16>(idx_addr, Ordering::Acquire) else {
-            self.mark_broken("shadow used index load failed");
-            return out;
-        };
-
-        while self.next_used != Wrapping(shadow_used_idx) {
-            let pos = self.next_used.0 % self.size;
-            let elem_addr = self.ring.used + 4 + u64::from(pos) * 8;
-            let (Ok(id), Ok(len)) = (
-                pool.mem().read_obj::<u32>(GuestAddress(elem_addr)),
-                pool.mem().read_obj::<u32>(GuestAddress(elem_addr + 4)),
-            ) else {
-                self.mark_broken("shadow used element read failed");
-                break;
+        'refill: loop {
+            let Ok(shadow_used_idx) = pool.mem().load::<u16>(idx_addr, Ordering::Acquire) else {
+                self.mark_broken("shadow used index load failed");
+                return out;
             };
 
-            // Translate the shadow head back to the captured chain.
-            let chain = if id < u32::from(self.size) {
-                self.inflight[id as usize].take()
-            } else {
-                None
-            };
-            let Some(chain) = chain else {
-                self.mark_broken("backend completed an unknown or stale used id");
-                break;
-            };
-            self.inflight_count -= 1;
+            while self.next_used != Wrapping(shadow_used_idx) {
+                let pos = self.next_used.0 % self.size;
+                let elem_addr = self.ring.used + 4 + u64::from(pos) * 8;
+                let (Ok(id), Ok(len)) = (
+                    pool.mem().read_obj::<u32>(GuestAddress(elem_addr)),
+                    pool.mem().read_obj::<u32>(GuestAddress(elem_addr + 4)),
+                ) else {
+                    self.mark_broken("shadow used element read failed");
+                    break;
+                };
 
-            // Never trust the backend's written length beyond the
-            // chain's device-writable capacity.
-            let writable_total: u64 = chain
-                .segments
-                .iter()
-                .filter(|s| s.writable)
-                .map(|s| u64::from(s.len))
-                .sum();
-            let len = u64::from(len).min(writable_total) as u32;
+                // Translate the shadow head back to the captured chain.
+                let chain = if id < u32::from(self.size) {
+                    self.inflight[id as usize].take()
+                } else {
+                    None
+                };
+                let Some(chain) = chain else {
+                    self.mark_broken("backend completed an unknown or stale used id");
+                    break;
+                };
+                self.inflight_count -= 1;
 
-            // Copy device-written data back to the captured guest
-            // addresses, walking writable segments in chain order.
-            let mut remaining = len;
-            let mut copy_failed = false;
-            for seg in chain.segments.iter().filter(|s| s.writable) {
-                if remaining == 0 {
+                // Never trust the backend's written length beyond the
+                // chain's device-writable capacity.
+                let writable_total: u64 = chain
+                    .segments
+                    .iter()
+                    .filter(|s| s.writable)
+                    .map(|s| u64::from(s.len))
+                    .sum();
+                let len = u64::from(len).min(writable_total) as u32;
+
+                // Copy device-written data back to the captured guest
+                // addresses, walking writable segments in chain order.
+                let mut remaining = len;
+                let mut copy_failed = false;
+                for seg in chain.segments.iter().filter(|s| s.writable) {
+                    if remaining == 0 {
+                        break;
+                    }
+                    let n = remaining.min(seg.len);
+                    if n == 0 {
+                        continue;
+                    }
+                    if let Err(e) = self.copy_chunked(
+                        |buf, offset| {
+                            pool.mem()
+                                .read_slice(buf, seg.pool_addr.unchecked_add(offset))
+                        },
+                        |buf, offset| {
+                            guest_mem.write_slice(buf, seg.guest_addr.unchecked_add(offset))
+                        },
+                        n,
+                    ) {
+                        self.mark_broken(&format!("guest buffer write-back failed: {e}"));
+                        copy_failed = true;
+                        break;
+                    }
+                    remaining -= n;
+                }
+                self.release_chain(pool, &chain);
+                if copy_failed {
                     break;
                 }
-                let n = remaining.min(seg.len);
-                if n == 0 {
-                    continue;
-                }
-                if let Err(e) = self.copy_chunked(
-                    |buf, offset| {
-                        pool.mem()
-                            .read_slice(buf, seg.pool_addr.unchecked_add(offset))
-                    },
-                    |buf, offset| guest_mem.write_slice(buf, seg.guest_addr.unchecked_add(offset)),
-                    n,
-                ) {
-                    self.mark_broken(&format!("guest buffer write-back failed: {e}"));
-                    copy_failed = true;
+
+                if guest_q.add_used(guest_mem, chain.guest_head, len).is_err() {
+                    self.mark_broken("guest used ring publish failed");
                     break;
                 }
-                remaining -= n;
-            }
-            self.release_chain(pool, &chain);
-            if copy_failed {
-                break;
+                out.chains += 1;
+                self.next_used += 1;
             }
 
-            if guest_q.add_used(guest_mem, chain.guest_head, len).is_err() {
-                self.mark_broken("guest used ring publish failed");
-                break;
+            if self.broken {
+                break 'refill;
             }
-            out.chains += 1;
-            self.next_used += 1;
+            // Arm the backend to notify for the next used entry (event-idx
+            // always-notify on the shadow ring; a backend not using
+            // event-idx ignores this field), then re-check in case it
+            // published and suppressed a notification while we were
+            // arming.
+            self.arm_backend_calls(pool);
+            let Ok(recheck) = pool.mem().load::<u16>(idx_addr, Ordering::Acquire) else {
+                self.mark_broken("shadow used index reload failed");
+                break 'refill;
+            };
+            if recheck == self.next_used.0 {
+                break 'refill;
+            }
         }
 
         if out.chains > 0 {
             out.needs_interrupt = self.guest_needs_interrupt(guest_mem, guest_q);
         }
         out
+    }
+
+    /// As the driver on the shadow ring, request that the backend notify
+    /// for the next used entry it produces (event-idx always-notify).
+    fn arm_backend_calls(&self, pool: &BouncePool) {
+        let addr = GuestAddress(self.ring.avail + 4 + u64::from(self.size) * 2);
+        let _ = pool.mem().store(self.next_used.0, addr, Ordering::Release);
     }
 
     /// Free a completed (or aborted) chain's pool extents and recycle
@@ -1115,7 +1145,6 @@ mod tests {
     // ---- Event index (plan commit 29) ----
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 29"]
     fn guest_interrupt_suppressed_until_used_event() {
         let mut h = harness(8, 8192);
         h.q = h.ring.queue_with(true);
@@ -1140,7 +1169,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 29"]
     fn shadow_rings_never_carry_event_idx_suppression() {
         // Even with the guest using event-idx, the shadow avail ring stays
         // in always-notify mode so the backend calls on every completion.

@@ -581,9 +581,17 @@ fn setup_bounce_session<T: VhostUserFrontendReqHandler>(
     }
     drop(guard);
 
+    // The worker drives the guest-side queues itself, so it must honor the
+    // negotiated EVENT_IDX: with it set, virtio-queue tracks used_event for
+    // interrupt suppression and keeps the device-written avail_event current.
+    let event_idx = acked_features & (1 << crate::VIRTIO_F_RING_EVENT_IDX) != 0;
     let worker_queues = queues
         .iter()
-        .map(|(i, q, e)| (*i, vm_virtio::clone_queue(q), e.try_clone().unwrap()))
+        .map(|(i, q, e)| {
+            let mut wq = vm_virtio::clone_queue(q);
+            wq.set_event_idx(event_idx);
+            (*i, wq, e.try_clone().unwrap())
+        })
         .collect::<Vec<_>>();
     let fds = bstate
         .fds
