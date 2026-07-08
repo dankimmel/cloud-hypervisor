@@ -1112,6 +1112,48 @@ mod tests {
         assert_eq!(h.sq.inflight_count(), 0);
     }
 
+    // ---- Event index (plan commit 29) ----
+
+    #[test]
+    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 29"]
+    fn guest_interrupt_suppressed_until_used_event() {
+        let mut h = harness(8, 8192);
+        h.q = h.ring.queue_with(true);
+        let mut heads = Vec::new();
+        for _ in 0..3 {
+            let buf = h.ring.alloc_buf(64);
+            let head = h.ring.chain(&h.mem, &[(buf, 64, true)]);
+            h.ring.publish(&h.mem, head);
+            heads.push(head);
+        }
+        assert_eq!(mirror(&mut h).chains, 3);
+        let shadow_heads: Vec<u16> = (0..3).map(|_| h.daemon.pop_avail(&h.pool, 0)).collect();
+
+        // Guest requests an interrupt only once the used index passes 1.
+        h.ring.set_used_event(&h.mem, 1);
+        // Completing the first chain (used idx -> 1) does not interrupt.
+        h.daemon.complete(&h.pool, 0, shadow_heads[0], 64);
+        assert!(!complete(&mut h).needs_interrupt);
+        // Completing the second (used idx -> 2) crosses used_event+1.
+        h.daemon.complete(&h.pool, 0, shadow_heads[1], 64);
+        assert!(complete(&mut h).needs_interrupt);
+    }
+
+    #[test]
+    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 29"]
+    fn shadow_rings_never_carry_event_idx_suppression() {
+        // Even with the guest using event-idx, the shadow avail ring stays
+        // in always-notify mode so the backend calls on every completion.
+        let mut h = harness(8, 8192);
+        h.q = h.ring.queue_with(true);
+        h.ring.set_used_event(&h.mem, 100);
+        let buf = h.ring.alloc_buf(64);
+        let head = h.ring.chain(&h.mem, &[(buf, 64, true)]);
+        h.ring.publish(&h.mem, head);
+        assert_eq!(mirror(&mut h).chains, 1);
+        assert_eq!(h.daemon.avail_flags(&h.pool, 0), 0);
+    }
+
     #[test]
     fn mirror_chain_longer_than_queue_marks_queue_broken() {
         let mut h = harness(4, 8192);

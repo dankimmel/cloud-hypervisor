@@ -243,6 +243,7 @@ mod tests {
         paused_sync: Arc<Barrier>,
         inflight_total: Arc<AtomicUsize>,
         drain_timeout: Duration,
+        event_idx: bool,
         handle: Option<thread::JoinHandle<()>>,
     }
 
@@ -286,17 +287,19 @@ mod tests {
             paused_sync: Arc::new(Barrier::new(2)),
             inflight_total: Arc::new(AtomicUsize::new(0)),
             drain_timeout: TIMEOUT,
+            event_idx: false,
             handle: None,
         }
     }
 
     impl WorkerHarness {
         fn start(&mut self) {
+            let event_idx = self.event_idx;
             let queues: Vec<(usize, virtio_queue::Queue, EventFd)> = (0..self.rings.len())
                 .map(|i| {
                     (
                         i,
-                        self.rings[i].queue(),
+                        self.rings[i].queue_with(event_idx),
                         self.guest_kicks[i].try_clone().unwrap(),
                     )
                 })
@@ -640,6 +643,48 @@ mod tests {
         assert_eq!(read_guest(&h.mem, resp, 64), vec![0x99; 64]);
         assert_eq!(h.rings[0].used_idx(&h.mem), 1);
         h.stop();
+    }
+
+    #[test]
+    #[ignore = "implemented in docs/vhost-user-bounce-plan.md commit 29"]
+    fn avail_event_kept_current_so_guest_always_kicks() {
+        // With the guest using event-idx, the worker must keep the
+        // device-written avail_event at the current avail index so the
+        // guest keeps kicking (the worker has no polling fallback).
+        let mut h = build(1, 8, 8192);
+        h.event_idx = true;
+        h.start();
+        for _ in 0..3 {
+            let buf = h.rings[0].alloc_buf(64);
+            let head = h.rings[0].chain(&h.mem, &[(buf, 64, false)]);
+            h.rings[0].publish(&h.mem, head);
+            h.kick_guest(0);
+            assert!(h.wait_backend_kick(0));
+        }
+        // After draining, avail_event has been advanced to the avail idx,
+        // so the next guest submission will kick.
+        assert!(
+            wait_avail_event(&h.rings[0], &h.mem, 3, TIMEOUT),
+            "avail_event not kept current"
+        );
+        h.stop();
+    }
+
+    /// Wait up to `timeout` for the ring's avail_event to reach `want`.
+    fn wait_avail_event(
+        ring: &GuestRingBuilder,
+        mem: &GuestMemoryMmap,
+        want: u16,
+        timeout: Duration,
+    ) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if ring.avail_event(mem) == want {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        ring.avail_event(mem) == want
     }
 
     /// Wait up to `timeout` for an atomic counter to reach `want`.

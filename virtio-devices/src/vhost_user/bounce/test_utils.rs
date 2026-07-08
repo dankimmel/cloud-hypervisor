@@ -78,8 +78,9 @@ impl GuestRingBuilder {
             .unwrap();
     }
 
-    /// Configure a virtio-queue `Queue` matching this ring.
-    pub(crate) fn queue(&self) -> Queue {
+    /// Configure a virtio-queue `Queue` matching this ring, optionally
+    /// with EVENT_IDX enabled (as the guest would negotiate it).
+    pub(crate) fn queue_with(&self, event_idx: bool) -> Queue {
         let mut q = Queue::new(self.queue_size).unwrap();
         q.try_set_desc_table_address(GuestAddress(self.desc_table))
             .unwrap();
@@ -89,8 +90,28 @@ impl GuestRingBuilder {
             .unwrap();
         q.set_next_avail(self.start);
         q.set_next_used(self.start);
+        q.set_event_idx(event_idx);
         q.set_ready(true);
         q
+    }
+
+    /// Configure a virtio-queue `Queue` matching this ring.
+    pub(crate) fn queue(&self) -> Queue {
+        self.queue_with(false)
+    }
+
+    /// Write the guest's `used_event` (in the avail ring): the device
+    /// should interrupt only once the used index passes this value.
+    pub(crate) fn set_used_event(&self, mem: &GuestMemoryMmap, val: u16) {
+        let addr = self.avail_ring + 4 + u64::from(self.queue_size) * 2;
+        mem.write_obj(val, GuestAddress(addr)).unwrap();
+    }
+
+    /// Read the device-written `avail_event` (in the used ring): the guest
+    /// kicks once its avail index passes this value.
+    pub(crate) fn avail_event(&self, mem: &GuestMemoryMmap) -> u16 {
+        let addr = self.used_ring + 4 + u64::from(self.queue_size) * 8;
+        mem.read_obj(GuestAddress(addr)).unwrap()
     }
 
     /// Reserve a buffer of `len` bytes in guest memory.
