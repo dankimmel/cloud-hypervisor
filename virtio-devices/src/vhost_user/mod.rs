@@ -520,24 +520,45 @@ pub struct VhostUserCommon {
     dirty_logging: bool,
 }
 
+/// Everything one bounce backend session needs at establishment,
+/// gathered so [`setup_bounce_session`]'s parameter list stays readable
+/// as fields accrete (vring bases, vIOMMU translator, ... were each
+/// added by separate changes).
+struct BounceSessionArgs<'a, T: VhostUserFrontendReqHandler> {
+    bstate: &'a bounce::BounceState,
+    vu: &'a Arc<Mutex<VhostUserHandle>>,
+    mem: &'a GuestMemoryAtomic<GuestMemoryMmap>,
+    queues: &'a [(usize, Queue, EventFd)],
+    interrupt_cb: Arc<dyn VirtioInterrupt>,
+    acked_features: u64,
+    backend_req_handler: &'a Option<FrontendReqHandler<T>>,
+    inflight: Option<&'a mut Inflight>,
+    vring_bases: Option<&'a [u64]>,
+    access_platform: Option<&'a Arc<dyn AccessPlatform>>,
+    bounce_kill: EventFd,
+    bounce_pause: EventFd,
+}
+
 /// Build the per-queue shadow queues, hand the backend the pool memory
 /// table and shadow rings via `setup_vhost_user`, and construct the
 /// data-plane worker. Called from `activate` when bounce is enabled.
-#[expect(clippy::too_many_arguments)]
 fn setup_bounce_session<T: VhostUserFrontendReqHandler>(
-    bstate: &bounce::BounceState,
-    vu: &Arc<Mutex<VhostUserHandle>>,
-    mem: &GuestMemoryAtomic<GuestMemoryMmap>,
-    queues: &[(usize, Queue, EventFd)],
-    interrupt_cb: Arc<dyn VirtioInterrupt>,
-    acked_features: u64,
-    backend_req_handler: &Option<FrontendReqHandler<T>>,
-    inflight: Option<&mut Inflight>,
-    vring_bases: Option<&[u64]>,
-    access_platform: Option<&Arc<dyn AccessPlatform>>,
-    bounce_kill: EventFd,
-    bounce_pause: EventFd,
+    args: BounceSessionArgs<'_, T>,
 ) -> result::Result<bounce::BounceEpollHandler, ActivateError> {
+    let BounceSessionArgs {
+        bstate,
+        vu,
+        mem,
+        queues,
+        interrupt_cb,
+        acked_features,
+        backend_req_handler,
+        inflight,
+        vring_bases,
+        access_platform,
+        bounce_kill,
+        bounce_pause,
+    } = args;
     let mem_ref = mem.memory();
     let mut guard = bstate.shared.lock().unwrap();
     guard.shadow.clear();
@@ -690,20 +711,20 @@ impl VhostUserCommon {
         let access_platform = self.access_platform();
         let bounce_handler = if let Some(bstate) = self.bounce.as_ref() {
             let (bounce_kill, bounce_pause) = bounce_evts.ok_or(ActivateError::BadActivate)?;
-            let handler = setup_bounce_session(
+            let handler = setup_bounce_session(BounceSessionArgs {
                 bstate,
                 vu,
-                &mem,
-                &queues,
-                interrupt_cb.clone(),
+                mem: &mem,
+                queues: &queues,
+                interrupt_cb: interrupt_cb.clone(),
                 acked_features,
-                &backend_req_handler,
-                inflight.as_mut(),
-                vring_bases.as_deref(),
-                access_platform.as_ref(),
+                backend_req_handler: &backend_req_handler,
+                inflight: inflight.as_mut(),
+                vring_bases: vring_bases.as_deref(),
+                access_platform: access_platform.as_ref(),
                 bounce_kill,
                 bounce_pause,
-            )?;
+            })?;
             Some(handler)
         } else {
             vu.lock()
