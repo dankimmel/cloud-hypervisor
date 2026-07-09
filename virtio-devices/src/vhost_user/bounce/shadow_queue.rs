@@ -72,7 +72,11 @@ pub struct CompleteOutcome {
 
 /// One captured guest buffer segment of an in-flight chain.
 struct Segment {
+    /// Guest buffer address, already vIOMMU-translated to a GPA.
     guest_addr: GuestAddress,
+    /// Pool extent backing this segment. Zero-length segments have no
+    /// extent and keep the `GuestAddress(0)` placeholder they are
+    /// captured with; nonzero segments get theirs during reservation.
     pool_addr: GuestAddress,
     len: u32,
     writable: bool,
@@ -96,23 +100,19 @@ struct InflightChain {
 /// Write a rewritten indirect table into the pool at `table`: one
 /// descriptor per segment, chained with `F_NEXT`, pointing at the pool
 /// buffer extents. Returns false on a pool write error.
-fn write_indirect_table(
-    pool: &BouncePool,
-    table: GuestAddress,
-    descs: &[(GuestAddress, u32, bool)],
-) -> bool {
-    for (i, (addr, len, writable)) in descs.iter().enumerate() {
+fn write_indirect_table(pool: &BouncePool, table: GuestAddress, segs: &[Segment]) -> bool {
+    for (i, seg) in segs.iter().enumerate() {
         let mut flags = 0u16;
-        if *writable {
+        if seg.writable {
             flags |= VRING_DESC_F_WRITE as u16;
         }
-        let next = if i + 1 < descs.len() {
+        let next = if i + 1 < segs.len() {
             flags |= VRING_DESC_F_NEXT as u16;
             (i + 1) as u16
         } else {
             0
         };
-        let d = Descriptor::new(addr.raw_value(), *len, flags, next);
+        let d = Descriptor::new(seg.pool_addr.raw_value(), seg.len, flags, next);
         if pool
             .mem()
             .write_obj(d, table.unchecked_add((i * 16) as u64))
@@ -124,19 +124,19 @@ fn write_indirect_table(
     true
 }
 
-/// Write a chain's descriptors into the shadow descriptor table at
-/// `slots`, chaining them with `F_NEXT`. `descs` is (pool addr, len,
-/// writable) per slot. Returns false on a pool write error (impossible
-/// for a valid pool, treated as an internal error by callers).
+/// Write a chain's segments into the shadow descriptor table at `slots`,
+/// chaining them with `F_NEXT` and pointing at the pool extents. Returns
+/// false on a pool write error (impossible for a valid pool, treated as
+/// an internal error by callers).
 fn write_shadow_chain(
     pool: &BouncePool,
     ring: &RingOffsets,
     slots: &[u16],
-    descs: &[(GuestAddress, u32, bool)],
+    segs: &[Segment],
 ) -> bool {
-    for (i, (addr, len, writable)) in descs.iter().enumerate() {
+    for (i, seg) in segs.iter().enumerate() {
         let mut flags = 0u16;
-        if *writable {
+        if seg.writable {
             flags |= VRING_DESC_F_WRITE as u16;
         }
         let next = if i + 1 < slots.len() {
@@ -145,7 +145,7 @@ fn write_shadow_chain(
         } else {
             0
         };
-        let shadow = Descriptor::new(addr.raw_value(), *len, flags, next);
+        let shadow = Descriptor::new(seg.pool_addr.raw_value(), seg.len, flags, next);
         let a = GuestAddress(ring.desc + u64::from(slots[i]) * 16);
         if pool.mem().write_obj(shadow, a).is_err() {
             return false;
@@ -262,27 +262,22 @@ impl ShadowQueue {
         let mut idx = Wrapping(new_base);
         for (_, slot) in &order {
             let chain = self.inflight[*slot].as_ref().unwrap();
-            let specs: Vec<(GuestAddress, u32, bool)> = chain
-                .segments
-                .iter()
-                .map(|s| (s.pool_addr, s.len, s.writable))
-                .collect();
             // Re-write the shadow descriptors (the pool extents still hold
             // this chain's data) and re-publish the avail entry. Pool
             // writes cannot fail for a valid pool.
             if let Some((table, _)) = chain.table_extent {
-                let ok = write_indirect_table(pool, table, &specs);
+                let ok = write_indirect_table(pool, table, &chain.segments);
                 debug_assert!(ok);
                 let head_desc = Descriptor::new(
                     table.raw_value(),
-                    (specs.len() * 16) as u32,
+                    (chain.segments.len() * 16) as u32,
                     VRING_DESC_F_INDIRECT as u16,
                     0,
                 );
                 let addr = GuestAddress(self.ring.desc + u64::from(chain.slots[0]) * 16);
                 let _ = pool.mem().write_obj(head_desc, addr);
             } else {
-                let ok = write_shadow_chain(pool, &self.ring, &chain.slots, &specs);
+                let ok = write_shadow_chain(pool, &self.ring, &chain.slots, &chain.segments);
                 debug_assert!(ok);
             }
             let pos = idx.0 % self.size;
@@ -367,14 +362,22 @@ impl ShadowQueue {
                 self.mark_broken("descriptor chain longer than the queue");
                 break 'chains;
             }
-            // Translate each buffer address through the vIOMMU (identity
-            // when none), then range-check the translated GPA. Everything
-            // downstream — copy-in, capture, copy-back — uses `xaddrs`.
-            let mut xaddrs: Vec<GuestAddress> = Vec::with_capacity(descs.len());
+
+            // Capture the chain as segments: translate each buffer address
+            // through the vIOMMU (identity when none) and range-check the
+            // translated GPA. Pool extents are reserved below; everything
+            // downstream — copy-in, shadow writes, copy-back — works from
+            // these segments.
+            let mut segments: Vec<Segment> = Vec::with_capacity(descs.len());
             let mut xlate_failed = false;
             for desc in &descs {
                 match self.translate(desc.addr(), desc.len()) {
-                    Ok(a) => xaddrs.push(a),
+                    Ok(gpa) => segments.push(Segment {
+                        guest_addr: gpa,
+                        pool_addr: GuestAddress(0),
+                        len: desc.len(),
+                        writable: desc.is_write_only(),
+                    }),
                     Err(()) => {
                         self.mark_broken("descriptor address translation failed");
                         xlate_failed = true;
@@ -385,8 +388,8 @@ impl ShadowQueue {
             if xlate_failed {
                 break 'chains;
             }
-            for (desc, xaddr) in descs.iter().zip(&xaddrs) {
-                if desc.len() != 0 && !guest_mem.check_range(*xaddr, desc.len() as usize) {
+            for seg in &segments {
+                if seg.len != 0 && !guest_mem.check_range(seg.guest_addr, seg.len as usize) {
                     self.mark_broken("descriptor buffer outside guest memory");
                     break 'chains;
                 }
@@ -395,19 +398,19 @@ impl ShadowQueue {
             // Pool bytes needed: the device-readable/writable buffers, plus
             // a table extent for an indirect chain.
             let table_bytes = if head_is_indirect {
-                (descs.len() * 16) as u64
+                (segments.len() * 16) as u64
             } else {
                 0
             };
-            let needed: u64 = descs
+            let needed: u64 = segments
                 .iter()
-                .filter(|d| d.len() != 0)
-                .map(|d| u64::from(d.len()).next_multiple_of(BOUNCE_ALLOC_ALIGN))
+                .filter(|s| s.len != 0)
+                .map(|s| u64::from(s.len).next_multiple_of(BOUNCE_ALLOC_ALIGN))
                 .sum::<u64>()
                 + table_bytes.next_multiple_of(BOUNCE_ALLOC_ALIGN);
             // Shadow slots needed: one for an indirect head, else one per
             // buffer descriptor.
-            let slots_needed = if head_is_indirect { 1 } else { descs.len() };
+            let slots_needed = if head_is_indirect { 1 } else { segments.len() };
 
             // Reserve shadow slots and pool extents all-or-nothing: on
             // failure roll everything back, rewind the guest cursor and
@@ -418,21 +421,19 @@ impl ShadowQueue {
                 out.stalled = true;
                 break 'chains;
             }
-            let mut extents: Vec<GuestAddress> = Vec::with_capacity(descs.len());
+            let mut allocated = 0;
             let mut stalled = false;
-            for desc in &descs {
-                let extent = if desc.len() == 0 {
-                    Some(GuestAddress(0))
-                } else {
-                    pool.alloc(u64::from(desc.len()))
-                };
-                match extent {
-                    Some(addr) => extents.push(addr),
-                    None => {
-                        stalled = true;
-                        break;
+            for seg in segments.iter_mut() {
+                if seg.len != 0 {
+                    match pool.alloc(u64::from(seg.len)) {
+                        Some(addr) => seg.pool_addr = addr,
+                        None => {
+                            stalled = true;
+                            break;
+                        }
                     }
                 }
+                allocated += 1;
             }
             // The indirect table extent is part of the same all-or-nothing
             // reservation.
@@ -448,7 +449,7 @@ impl ShadowQueue {
                 None
             };
             if stalled {
-                self.rollback_extents(pool, &descs, &extents);
+                self.rollback_segments(pool, &segments[..allocated]);
                 guest_q.go_to_previous_position();
                 self.enter_stall(needed, pool.buffer_capacity());
                 out.stalled = true;
@@ -456,16 +457,19 @@ impl ShadowQueue {
             }
 
             // Copy device-readable data into the pool.
-            for ((desc, extent), xaddr) in descs.iter().zip(&extents).zip(&xaddrs) {
-                if desc.len() == 0 || desc.is_write_only() {
+            for seg in &segments {
+                if seg.len == 0 || seg.writable {
                     continue;
                 }
                 if let Err(e) = self.copy_chunked(
-                    |buf, offset| guest_mem.read_slice(buf, xaddr.unchecked_add(offset)),
-                    |buf, offset| pool.mem().write_slice(buf, extent.unchecked_add(offset)),
-                    desc.len(),
+                    |buf, offset| guest_mem.read_slice(buf, seg.guest_addr.unchecked_add(offset)),
+                    |buf, offset| {
+                        pool.mem()
+                            .write_slice(buf, seg.pool_addr.unchecked_add(offset))
+                    },
+                    seg.len,
                 ) {
-                    self.rollback_extents(pool, &descs, &extents);
+                    self.rollback_segments(pool, &segments);
                     if let Some((addr, len)) = table_extent {
                         let _ = pool.free(addr, len);
                     }
@@ -474,23 +478,17 @@ impl ShadowQueue {
                 }
             }
 
-            let specs: Vec<(GuestAddress, u32, bool)> = descs
-                .iter()
-                .zip(&extents)
-                .map(|(d, a)| (*a, d.len(), d.is_write_only()))
-                .collect();
-
             // Write the shadow descriptors. Writes into the pool cannot
             // fail for a valid pool; treat failure as an internal error.
             let slots = if let Some((table, _)) = table_extent {
-                if !write_indirect_table(pool, table, &specs) {
+                if !write_indirect_table(pool, table, &segments) {
                     self.mark_broken("indirect table write failed");
                     break 'chains;
                 }
                 let slot = self.free_slots.pop().unwrap();
                 let head_desc = Descriptor::new(
                     table.raw_value(),
-                    (descs.len() * 16) as u32,
+                    (segments.len() * 16) as u32,
                     VRING_DESC_F_INDIRECT as u16,
                     0,
                 );
@@ -501,11 +499,11 @@ impl ShadowQueue {
                 }
                 vec![slot]
             } else {
-                let mut slots = Vec::with_capacity(descs.len());
-                for _ in 0..descs.len() {
+                let mut slots = Vec::with_capacity(segments.len());
+                for _ in 0..segments.len() {
                     slots.push(self.free_slots.pop().unwrap());
                 }
-                if !write_shadow_chain(pool, &self.ring, &slots, &specs) {
+                if !write_shadow_chain(pool, &self.ring, &slots, &segments) {
                     self.mark_broken("shadow descriptor write failed");
                     break 'chains;
                 }
@@ -522,17 +520,6 @@ impl ShadowQueue {
             }
             self.shadow_avail_idx += 1;
 
-            let segments = descs
-                .iter()
-                .zip(&extents)
-                .zip(&xaddrs)
-                .map(|((d, a), xaddr)| Segment {
-                    guest_addr: *xaddr,
-                    pool_addr: *a,
-                    len: d.len(),
-                    writable: d.is_write_only(),
-                })
-                .collect();
             let head_slot = usize::from(slots[0]);
             debug_assert!(self.inflight[head_slot].is_none());
             let seq = self.next_seq;
@@ -638,18 +625,14 @@ impl ShadowQueue {
         )
     }
 
-    /// Free the extents allocated so far for a chain that will not be
-    /// published. `extents` parallels the leading elements of `descs`.
-    fn rollback_extents(
-        &mut self,
-        pool: &mut BouncePool,
-        descs: &[Descriptor],
-        extents: &[GuestAddress],
-    ) {
-        for (desc, extent) in descs.iter().zip(extents) {
-            if desc.len() != 0 {
+    /// Free the pool extents of segments belonging to a chain that will
+    /// not be published. Pass only the segments whose extents were
+    /// actually reserved.
+    fn rollback_segments(&mut self, pool: &mut BouncePool, segs: &[Segment]) {
+        for seg in segs {
+            if seg.len != 0 {
                 // Freeing a just-allocated extent cannot fail.
-                let res = pool.free(*extent, u64::from(desc.len()));
+                let res = pool.free(seg.pool_addr, u64::from(seg.len));
                 debug_assert!(res.is_ok());
             }
         }
