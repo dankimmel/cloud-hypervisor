@@ -354,6 +354,32 @@ mod tests {
             wait_readable(self.pool_fds[q].shadow_kick.as_raw_fd(), TIMEOUT)
         }
 
+        /// Wait until the worker has consumed the guest kick for queue
+        /// `q`, which proves it is inside its epoll loop: the pre-loop
+        /// startup sweep mirrors rings but never reads kick eventfds, so
+        /// `wait_backend_kick` alone can be satisfied before the loop is
+        /// entered. Pausing before this point races EpollHelper's
+        /// pre-loop paused guard — the worker parks without acking the
+        /// pause barrier and the test deadlocks.
+        fn wait_worker_in_loop(&self, q: usize) -> bool {
+            let deadline = Instant::now() + TIMEOUT;
+            let fd = self.guest_kicks[q].as_raw_fd();
+            while Instant::now() < deadline {
+                let mut pfd = libc::pollfd {
+                    fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // SAFETY: FFI call with a valid single-element pollfd.
+                let ret = unsafe { libc::poll(&mut pfd, 1, 0) };
+                if ret == 0 {
+                    return true;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            false
+        }
+
         fn signal_backend_call(&self, q: usize) {
             self.pool_fds[q].shadow_call.write(1).unwrap();
         }
@@ -481,6 +507,8 @@ mod tests {
         h.kick_guest(0);
         assert!(h.wait_backend_kick(0));
 
+        assert!(h.wait_worker_in_loop(0), "worker never reached epoll loop");
+
         // Backend completes but the worker is NOT signalled via the call
         // eventfd; the pause drain must still flush it.
         {
@@ -575,6 +603,8 @@ mod tests {
         h.kick_guest(0);
         assert!(h.wait_backend_kick(0));
 
+        assert!(h.wait_worker_in_loop(0), "worker never reached epoll loop");
+
         // Backend completes but does not signal; the pause drain must both
         // flush it back to the guest and zero the in-flight counter so a
         // subsequent snapshot is allowed.
@@ -607,6 +637,7 @@ mod tests {
         h.kick_guest(0);
         assert!(h.wait_backend_kick(0));
         assert!(wait_value(&h.inflight_total, 1, TIMEOUT));
+        assert!(h.wait_worker_in_loop(0), "worker never reached epoll loop");
 
         // Do not complete anything. Pause must still return.
         h.paused.store(true, Ordering::SeqCst);
