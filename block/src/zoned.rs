@@ -159,18 +159,104 @@ pub struct VirtioBlockZonedConfig {
     pub model: u8,
 }
 
+/// Field offsets within the configuration-space tail, i.e. relative to
+/// [`VIRTIO_BLK_CONFIG_BASE_LEN`].
+mod tail_offset {
+    pub const MAX_SECURE_ERASE_SECTORS: usize = 0;
+    pub const MAX_SECURE_ERASE_SEG: usize = 4;
+    pub const SECURE_ERASE_SECTOR_ALIGNMENT: usize = 8;
+    pub const ZONE_SECTORS: usize = 12;
+    pub const MAX_OPEN_ZONES: usize = 16;
+    pub const MAX_ACTIVE_ZONES: usize = 20;
+    pub const MAX_APPEND_SECTORS: usize = 24;
+    pub const WRITE_GRANULARITY: usize = 28;
+    pub const MODEL: usize = 32;
+    // Offsets 33..36 are `unused2` and must read as zero.
+}
+
+/// Read a little-endian `u32` at `offset`.
+///
+/// The caller must have already checked that `buf` is long enough; the copy
+/// below panics only on a programming error in this module.
+fn read_le_u32(buf: &[u8], offset: usize) -> u32 {
+    let mut field = [0u8; 4];
+    field.copy_from_slice(&buf[offset..offset + 4]);
+    u32::from_le_bytes(field)
+}
+
+/// Write `value` as little-endian at `offset`.
+fn write_le_u32(buf: &mut [u8], offset: usize, value: u32) {
+    buf[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
 impl VirtioBlockZonedConfig {
     /// Parse the configuration-space tail as returned by a vhost-user backend.
     ///
     /// `tail` must be exactly [`VIRTIO_BLK_CONFIG_TAIL_LEN`] bytes, i.e. the
     /// bytes at offset [`VIRTIO_BLK_CONFIG_BASE_LEN`] onwards.
-    pub fn from_le_bytes(_tail: &[u8]) -> Result<Self, ZonedError> {
-        unimplemented!("implemented in a follow-up commit")
+    pub fn from_le_bytes(tail: &[u8]) -> Result<Self, ZonedError> {
+        if tail.len() != VIRTIO_BLK_CONFIG_TAIL_LEN {
+            return Err(ZonedError::TailLength {
+                expected: VIRTIO_BLK_CONFIG_TAIL_LEN,
+                got: tail.len(),
+            });
+        }
+
+        Ok(Self {
+            max_secure_erase_sectors: read_le_u32(tail, tail_offset::MAX_SECURE_ERASE_SECTORS),
+            max_secure_erase_seg: read_le_u32(tail, tail_offset::MAX_SECURE_ERASE_SEG),
+            secure_erase_sector_alignment: read_le_u32(
+                tail,
+                tail_offset::SECURE_ERASE_SECTOR_ALIGNMENT,
+            ),
+            zone_sectors: read_le_u32(tail, tail_offset::ZONE_SECTORS),
+            max_open_zones: read_le_u32(tail, tail_offset::MAX_OPEN_ZONES),
+            max_active_zones: read_le_u32(tail, tail_offset::MAX_ACTIVE_ZONES),
+            max_append_sectors: read_le_u32(tail, tail_offset::MAX_APPEND_SECTORS),
+            write_granularity: read_le_u32(tail, tail_offset::WRITE_GRANULARITY),
+            model: tail[tail_offset::MODEL],
+        })
     }
 
     /// Serialise to the little-endian configuration-space tail.
     pub fn to_le_bytes(&self) -> [u8; VIRTIO_BLK_CONFIG_TAIL_LEN] {
-        unimplemented!("implemented in a follow-up commit")
+        let mut tail = [0u8; VIRTIO_BLK_CONFIG_TAIL_LEN];
+
+        write_le_u32(
+            &mut tail,
+            tail_offset::MAX_SECURE_ERASE_SECTORS,
+            self.max_secure_erase_sectors,
+        );
+        write_le_u32(
+            &mut tail,
+            tail_offset::MAX_SECURE_ERASE_SEG,
+            self.max_secure_erase_seg,
+        );
+        write_le_u32(
+            &mut tail,
+            tail_offset::SECURE_ERASE_SECTOR_ALIGNMENT,
+            self.secure_erase_sector_alignment,
+        );
+        write_le_u32(&mut tail, tail_offset::ZONE_SECTORS, self.zone_sectors);
+        write_le_u32(&mut tail, tail_offset::MAX_OPEN_ZONES, self.max_open_zones);
+        write_le_u32(
+            &mut tail,
+            tail_offset::MAX_ACTIVE_ZONES,
+            self.max_active_zones,
+        );
+        write_le_u32(
+            &mut tail,
+            tail_offset::MAX_APPEND_SECTORS,
+            self.max_append_sectors,
+        );
+        write_le_u32(
+            &mut tail,
+            tail_offset::WRITE_GRANULARITY,
+            self.write_granularity,
+        );
+        tail[tail_offset::MODEL] = self.model;
+
+        tail
     }
 
     /// Check that the reported characteristics describe a device the guest can
@@ -217,8 +303,18 @@ pub fn check_restore_compat(
 }
 
 /// Concatenate the base configuration space with the zoned tail, if any.
-pub fn assemble_config_space(_base: &[u8], _tail: Option<&VirtioBlockZonedConfig>) -> Vec<u8> {
-    unimplemented!("implemented in a follow-up commit")
+///
+/// Passing `None` yields the base configuration space unchanged, which is what
+/// every non-zoned device continues to expose to the guest.
+pub fn assemble_config_space(base: &[u8], tail: Option<&VirtioBlockZonedConfig>) -> Vec<u8> {
+    let Some(tail) = tail else {
+        return base.to_vec();
+    };
+
+    let mut config = Vec::with_capacity(base.len() + VIRTIO_BLK_CONFIG_TAIL_LEN);
+    config.extend_from_slice(base);
+    config.extend_from_slice(&tail.to_le_bytes());
+    config
 }
 
 #[cfg(test)]
@@ -244,13 +340,11 @@ mod tests {
     // ---------------------------------------------------------------------
 
     #[test]
-    #[ignore = "not yet implemented"]
     fn base_len_matches_virtio_block_config() {
         assert_eq!(VIRTIO_BLK_CONFIG_BASE_LEN, size_of::<VirtioBlockConfig>());
     }
 
     #[test]
-    #[ignore = "not yet implemented"]
     fn layout_constants_are_consistent() {
         assert_eq!(VIRTIO_BLK_CONFIG_TAIL_LEN, 36);
         assert_eq!(VIRTIO_BLK_CONFIG_ZONED_TOTAL_LEN, 96);
@@ -262,7 +356,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "not yet implemented"]
     fn to_le_bytes_places_fields_at_spec_offsets() {
         let cfg = VirtioBlockZonedConfig {
             max_secure_erase_sectors: 0x0403_0201,
@@ -294,7 +387,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "not yet implemented"]
     fn zoned_section_starts_at_offset_72_of_config_space() {
         let cfg = VirtioBlockZonedConfig {
             zone_sectors: 0xdead_beef,
@@ -307,7 +399,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "not yet implemented"]
     fn model_lands_at_config_space_offset_92() {
         let cfg = VirtioBlockZonedConfig {
             model: VIRTIO_BLK_Z_HM as u8,
@@ -318,14 +409,12 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "not yet implemented"]
     fn to_le_bytes_reserved_bytes_are_zero() {
         let bytes = valid_hm().to_le_bytes();
         assert_eq!(&bytes[33..36], &[0, 0, 0]);
     }
 
     #[test]
-    #[ignore = "not yet implemented"]
     fn byte_round_trip_is_lossless() {
         let cfg = VirtioBlockZonedConfig {
             max_secure_erase_sectors: 1,
@@ -343,7 +432,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "not yet implemented"]
     fn from_le_bytes_decodes_little_endian() {
         let mut tail = [0u8; VIRTIO_BLK_CONFIG_TAIL_LEN];
         // zone_sectors is at tail offset 12.
@@ -356,7 +444,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "not yet implemented"]
     fn from_le_bytes_ignores_reserved_bytes() {
         let mut tail = valid_hm().to_le_bytes();
         tail[33..36].copy_from_slice(&[0xff, 0xff, 0xff]);
@@ -367,7 +454,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "not yet implemented"]
     fn from_le_bytes_rejects_short_input() {
         let err = VirtioBlockZonedConfig::from_le_bytes(&[0u8; 35]).unwrap_err();
         assert_eq!(
@@ -380,7 +466,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "not yet implemented"]
     fn from_le_bytes_rejects_long_input() {
         let err = VirtioBlockZonedConfig::from_le_bytes(&[0u8; 37]).unwrap_err();
         assert_eq!(
@@ -393,7 +478,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "not yet implemented"]
     fn from_le_bytes_rejects_empty_input() {
         VirtioBlockZonedConfig::from_le_bytes(&[]).unwrap_err();
     }
@@ -623,7 +707,6 @@ mod tests {
     // ---------------------------------------------------------------------
 
     #[test]
-    #[ignore = "not yet implemented"]
     fn assemble_without_tail_returns_base_unchanged() {
         let base: Vec<u8> = (0..VIRTIO_BLK_CONFIG_BASE_LEN as u8).collect();
         let out = assemble_config_space(&base, None);
@@ -632,7 +715,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "not yet implemented"]
     fn assemble_with_tail_produces_full_zoned_length() {
         let base = vec![0u8; VIRTIO_BLK_CONFIG_BASE_LEN];
         let out = assemble_config_space(&base, Some(&valid_hm()));
@@ -640,7 +722,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "not yet implemented"]
     fn assemble_preserves_base_bytes() {
         let base: Vec<u8> = (0..VIRTIO_BLK_CONFIG_BASE_LEN as u8).collect();
         let out = assemble_config_space(&base, Some(&valid_hm()));
@@ -648,7 +729,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "not yet implemented"]
     fn assemble_appends_tail_verbatim() {
         let cfg = valid_hm();
         let out = assemble_config_space(&[0u8; VIRTIO_BLK_CONFIG_BASE_LEN], Some(&cfg));
@@ -656,7 +736,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "not yet implemented"]
     fn assemble_passes_secure_erase_fields_through() {
         let cfg = VirtioBlockZonedConfig {
             max_secure_erase_sectors: 0xaabb_ccdd,
