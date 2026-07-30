@@ -312,22 +312,33 @@ impl VirtioBlockZonedConfig {
 }
 
 /// Whether `VIRTIO_BLK_F_ZONED` is set in `features`.
-pub fn zoned_negotiated(_features: u64) -> bool {
-    unimplemented!("implemented in a follow-up commit")
+pub fn zoned_negotiated(features: u64) -> bool {
+    features & (1u64 << VIRTIO_BLK_F_ZONED) != 0
 }
 
 /// Length of configuration space to request from a vhost-user-blk backend.
 ///
 /// Requesting the zoned length from a backend that is not zoned would fail, as
 /// the vhost-user `GET_CONFIG` reply must match the requested size exactly.
-pub fn config_space_len(_zoned: bool) -> usize {
-    unimplemented!("implemented in a follow-up commit")
+pub fn config_space_len(zoned: bool) -> usize {
+    if zoned {
+        VIRTIO_BLK_CONFIG_ZONED_TOTAL_LEN
+    } else {
+        VIRTIO_BLK_CONFIG_BASE_LEN
+    }
 }
 
 /// Strip `VIRTIO_BLK_F_ZONED` from the guest-facing feature set unless the
 /// backend is actually serving a zoned disk.
-pub fn gate_features(_avail_features: u64, _exposure: ZonedExposure) -> u64 {
-    unimplemented!("implemented in a follow-up commit")
+///
+/// Only the zoned bit is touched; every other feature is passed through
+/// untouched, so this is safe to apply unconditionally.
+pub fn gate_features(avail_features: u64, exposure: ZonedExposure) -> u64 {
+    if exposure.is_exposed() {
+        avail_features
+    } else {
+        avail_features & !(1u64 << VIRTIO_BLK_F_ZONED)
+    }
 }
 
 /// Reject a restore that would silently drop zoned semantics.
@@ -337,10 +348,14 @@ pub fn gate_features(_avail_features: u64, _exposure: ZonedExposure) -> u64 {
 /// that cannot serve them would fail in ways the guest cannot recover from, so
 /// this fails the restore outright.
 pub fn check_restore_compat(
-    _state_avail_features: u64,
-    _backend_features: u64,
+    state_avail_features: u64,
+    backend_features: u64,
 ) -> Result<(), ZonedError> {
-    unimplemented!("implemented in a follow-up commit")
+    if zoned_negotiated(state_avail_features) && !zoned_negotiated(backend_features) {
+        return Err(ZonedError::RestoreBackendNotZoned);
+    }
+
+    Ok(())
 }
 
 /// Concatenate the base configuration space with the zoned tail, if any.
@@ -633,7 +648,6 @@ mod tests {
     // ---------------------------------------------------------------------
 
     #[test]
-    #[ignore = "not yet implemented"]
     fn zoned_negotiated_detects_the_bit() {
         assert!(zoned_negotiated(1u64 << VIRTIO_BLK_F_ZONED));
         assert!(!zoned_negotiated(0));
@@ -641,14 +655,12 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "not yet implemented"]
     fn config_space_len_depends_on_zoned() {
         assert_eq!(config_space_len(false), VIRTIO_BLK_CONFIG_BASE_LEN);
         assert_eq!(config_space_len(true), VIRTIO_BLK_CONFIG_ZONED_TOTAL_LEN);
     }
 
     #[test]
-    #[ignore = "not yet implemented"]
     fn gate_features_keeps_bit_when_exposed() {
         let features = 1u64 << VIRTIO_BLK_F_ZONED;
         assert_eq!(
@@ -658,21 +670,18 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "not yet implemented"]
     fn gate_features_strips_bit_when_not_advertised() {
         let features = 1u64 << VIRTIO_BLK_F_ZONED;
         assert_eq!(gate_features(features, ZonedExposure::NotAdvertised), 0);
     }
 
     #[test]
-    #[ignore = "not yet implemented"]
     fn gate_features_strips_bit_for_model_none() {
         let features = 1u64 << VIRTIO_BLK_F_ZONED;
         assert_eq!(gate_features(features, ZonedExposure::ModelNone), 0);
     }
 
     #[test]
-    #[ignore = "not yet implemented"]
     fn gate_features_leaves_other_bits_untouched() {
         let others = !(1u64 << VIRTIO_BLK_F_ZONED);
         assert_eq!(gate_features(others, ZonedExposure::NotAdvertised), others);
@@ -681,7 +690,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "not yet implemented"]
     fn gate_features_is_idempotent() {
         let features = 1u64 << VIRTIO_BLK_F_ZONED;
         let once = gate_features(features, ZonedExposure::NotAdvertised);
@@ -700,33 +708,28 @@ mod tests {
     // ---------------------------------------------------------------------
 
     #[test]
-    #[ignore = "not yet implemented"]
     fn restore_non_zoned_onto_non_zoned_backend_is_allowed() {
         check_restore_compat(0, 0).unwrap();
     }
 
     #[test]
-    #[ignore = "not yet implemented"]
     fn restore_non_zoned_onto_zoned_backend_is_allowed() {
         check_restore_compat(0, 1u64 << VIRTIO_BLK_F_ZONED).unwrap();
     }
 
     #[test]
-    #[ignore = "not yet implemented"]
     fn restore_zoned_onto_zoned_backend_is_allowed() {
         let zoned = 1u64 << VIRTIO_BLK_F_ZONED;
         check_restore_compat(zoned, zoned).unwrap();
     }
 
     #[test]
-    #[ignore = "not yet implemented"]
     fn restore_zoned_onto_non_zoned_backend_is_rejected() {
         let err = check_restore_compat(1u64 << VIRTIO_BLK_F_ZONED, 0).unwrap_err();
         assert_eq!(err, ZonedError::RestoreBackendNotZoned);
     }
 
     #[test]
-    #[ignore = "not yet implemented"]
     fn restore_compat_ignores_unrelated_features() {
         let unrelated = 0xffu64;
         check_restore_compat(unrelated, 0).unwrap();
