@@ -10,6 +10,7 @@ use std::sync::{Arc, Barrier, Mutex};
 use std::{io, result};
 
 use anyhow::anyhow;
+use block::zoned::ZonedError;
 use event_monitor::event;
 use log::{error, info, warn};
 use seccompiler::SeccompAction;
@@ -179,6 +180,8 @@ pub enum Error {
     EpollWait(#[source] io::Error),
     #[error("Aborted vhost-user connect: kill event received")]
     ConnectKilled,
+    #[error("Backend reported an unusable zoned block device configuration")]
+    ZonedConfig(#[source] ZonedError),
 }
 type Result<T> = result::Result<T, Error>;
 

@@ -75,38 +75,35 @@ pub const VIRTIO_BLK_CONFIG_ZONED_OFFSET: usize =
 #[derive(Error, Debug, Copy, Clone, PartialEq, Eq)]
 pub enum ZonedError {
     /// The zoned tail returned by the backend was not the expected length.
-    #[error("zoned config tail has wrong length: expected {expected} bytes, got {got}")]
+    #[error("Zoned config tail has wrong length: expected {expected} bytes, got {got}")]
     TailLength { expected: usize, got: usize },
     /// The backend reported a zoned model this build does not understand.
     ///
     /// Refused rather than downgraded: an unrecognised model may still require
     /// zone-aware access, and presenting such a disk to the guest as a regular
     /// block device could corrupt it.
-    #[error(
-        "backend reported unknown zoned model {0}; refusing to expose the device \
-         rather than risk presenting a zone-managed disk as a regular one"
-    )]
+    #[error("Backend reported unknown zoned model {0}")]
     UnknownModel(u8),
     /// A host-managed device reported a zone size of zero.
-    #[error("host-managed zoned backend reported a zone size of zero sectors")]
+    #[error("Host-managed zoned backend reported a zone size of zero sectors")]
     ZeroZoneSectors,
     /// A host-managed device reported a zone size that is not a power of two.
     ///
     /// The Linux virtio-blk driver rejects such a device, so this is caught
     /// here to produce a comprehensible error instead of an opaque guest-side
     /// probe failure.
-    #[error("host-managed zoned backend reported a non-power-of-two zone size of {0} sectors")]
+    #[error("Host-managed zoned backend reported a non-power-of-two zone size of {0} sectors")]
     UnalignedZoneSectors(u32),
     /// A host-managed device reported that zone append is unsupported.
-    #[error("host-managed zoned backend reported zero max append sectors")]
+    #[error("Host-managed zoned backend reported zero max append sectors")]
     ZeroMaxAppendSectors,
     /// A host-managed device reported a write granularity of zero.
-    #[error("host-managed zoned backend reported a write granularity of zero")]
+    #[error("Host-managed zoned backend reported a write granularity of zero")]
     ZeroWriteGranularity,
     /// A zoned device is being restored onto a backend that is not zoned.
     #[error(
-        "cannot restore a zoned virtio-blk device: the destination vhost-user backend \
-         does not advertise VIRTIO_BLK_F_ZONED"
+        "Cannot restore a zoned virtio-blk device: destination backend does not \
+         advertise VIRTIO_BLK_F_ZONED"
     )]
     RestoreBackendNotZoned,
 }
