@@ -18,6 +18,7 @@ pub(crate) mod aligned_buffer;
 pub mod aligned_file;
 pub mod formats;
 mod sparse;
+pub mod zoned;
 use std::fmt::{self, Debug};
 use std::fs::{File, OpenOptions};
 use std::os::linux::fs::MetadataExt;
