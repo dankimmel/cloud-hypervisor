@@ -159,6 +159,17 @@ pub struct VirtioBlockZonedConfig {
     pub model: u8,
 }
 
+/// Not a zoned disk. Legal even when the backend advertises
+/// `VIRTIO_BLK_F_ZONED`: a backend able to serve zoned disks may still be
+/// configured with a conventional one.
+const MODEL_NONE: u8 = VIRTIO_BLK_Z_NONE as u8;
+/// Host-managed: writes within a zone must be sequential, and the guest needs
+/// the zone geometry to drive the disk at all.
+const MODEL_HM: u8 = VIRTIO_BLK_Z_HM as u8;
+/// Host-aware: accepts non-sequential writes, so it is safe to drive as a
+/// conventional disk.
+const MODEL_HA: u8 = VIRTIO_BLK_Z_HA as u8;
+
 /// Field offsets within the configuration-space tail, i.e. relative to
 /// [`VIRTIO_BLK_CONFIG_BASE_LEN`].
 mod tail_offset {
@@ -266,7 +277,37 @@ impl VirtioBlockZonedConfig {
     /// driver presents them as regular block devices, so their zoned fields are
     /// advisory.
     pub fn validate(&self) -> Result<ZonedExposure, ZonedError> {
-        unimplemented!("implemented in a follow-up commit")
+        match self.model {
+            MODEL_NONE => Ok(ZonedExposure::ModelNone),
+            // Host-aware disks accept ordinary writes anywhere, and the Linux
+            // driver deliberately presents them as regular block devices, so
+            // the geometry fields below are advisory and not worth failing on.
+            MODEL_HA => Ok(ZonedExposure::Expose),
+            MODEL_HM => {
+                // A host-managed disk is only usable if the guest can derive a
+                // zone layout from these fields. The Linux virtio-blk driver
+                // refuses to probe a device that reports any of them as zero,
+                // or a zone size that is not a power of two, so checking here
+                // turns an opaque guest-side probe failure into a clear
+                // VMM-side error naming the offending field.
+                if self.zone_sectors == 0 {
+                    return Err(ZonedError::ZeroZoneSectors);
+                }
+                if !self.zone_sectors.is_power_of_two() {
+                    return Err(ZonedError::UnalignedZoneSectors(self.zone_sectors));
+                }
+                if self.max_append_sectors == 0 {
+                    return Err(ZonedError::ZeroMaxAppendSectors);
+                }
+                if self.write_granularity == 0 {
+                    return Err(ZonedError::ZeroWriteGranularity);
+                }
+                // max_open_zones and max_active_zones are unconstrained: zero
+                // is the specified encoding for "no limit".
+                Ok(ZonedExposure::Expose)
+            }
+            other => Err(ZonedError::UnknownModel(other)),
+        }
     }
 }
 
@@ -487,13 +528,11 @@ mod tests {
     // ---------------------------------------------------------------------
 
     #[test]
-    #[ignore = "not yet implemented"]
     fn host_managed_valid_config_is_exposed() {
         assert_eq!(valid_hm().validate().unwrap(), ZonedExposure::Expose);
     }
 
     #[test]
-    #[ignore = "not yet implemented"]
     fn host_managed_rejects_zero_zone_sectors() {
         let cfg = VirtioBlockZonedConfig {
             zone_sectors: 0,
@@ -503,7 +542,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "not yet implemented"]
     fn host_managed_rejects_non_power_of_two_zone_sectors() {
         let cfg = VirtioBlockZonedConfig {
             zone_sectors: 0x1_0001,
@@ -516,7 +554,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "not yet implemented"]
     fn host_managed_accepts_minimal_power_of_two_zone_size() {
         let cfg = VirtioBlockZonedConfig {
             zone_sectors: 1,
@@ -526,7 +563,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "not yet implemented"]
     fn host_managed_rejects_zero_max_append_sectors() {
         let cfg = VirtioBlockZonedConfig {
             max_append_sectors: 0,
@@ -539,7 +575,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "not yet implemented"]
     fn host_managed_rejects_zero_write_granularity() {
         let cfg = VirtioBlockZonedConfig {
             write_granularity: 0,
@@ -552,7 +587,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "not yet implemented"]
     fn host_managed_allows_unlimited_open_and_active_zones() {
         let cfg = VirtioBlockZonedConfig {
             max_open_zones: 0,
@@ -563,7 +597,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "not yet implemented"]
     fn host_aware_skips_geometry_checks() {
         // The Linux driver presents host-aware devices as regular block
         // devices, so nonsensical geometry must not fail the device.
@@ -578,7 +611,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "not yet implemented"]
     fn model_none_is_not_exposed() {
         let cfg = VirtioBlockZonedConfig {
             model: VIRTIO_BLK_Z_NONE as u8,
@@ -588,7 +620,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "not yet implemented"]
     fn unknown_model_is_rejected() {
         let cfg = VirtioBlockZonedConfig {
             model: 3,
@@ -658,7 +689,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "not yet implemented"]
     fn exposure_is_exposed_only_for_expose() {
         assert!(ZonedExposure::Expose.is_exposed());
         assert!(!ZonedExposure::NotAdvertised.is_exposed());
