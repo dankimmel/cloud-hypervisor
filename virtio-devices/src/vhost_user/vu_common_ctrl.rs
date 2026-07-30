@@ -361,6 +361,11 @@ impl VhostUserHandle {
         Ok(backend_features)
     }
 
+    /// Re-establish a backend connection for an already-running device.
+    ///
+    /// `required_backend_features` names VIRTIO features the guest has already
+    /// negotiated and that the reconnected backend must therefore still
+    /// advertise; the reconnect fails if any are missing.
     #[expect(clippy::too_many_arguments)]
     pub fn reinitialize_vhost_user<S: VhostUserFrontendReqHandler>(
         &mut self,
@@ -369,10 +374,23 @@ impl VhostUserHandle {
         virtio_interrupt: &dyn VirtioInterrupt,
         acked_features: u64,
         acked_protocol_features: u64,
+        required_backend_features: u64,
         backend_req_handler: &Option<FrontendReqHandler<S>>,
         inflight: Option<&mut Inflight>,
     ) -> Result<()> {
-        self.set_protocol_features_vhost_user(acked_features, acked_protocol_features)?;
+        let backend_features =
+            self.set_protocol_features_vhost_user(acked_features, acked_protocol_features)?;
+
+        // Checked before the backend is set up: a feature already negotiated
+        // with the guest cannot be withdrawn from a running guest, so a backend
+        // that no longer offers one is unusable rather than merely degraded.
+        let missing = required_backend_features & !backend_features;
+        if missing != 0 {
+            return Err(Error::ReconnectMissingFeatures {
+                missing,
+                advertised: backend_features,
+            });
+        }
 
         self.setup_vhost_user(
             mem,

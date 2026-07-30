@@ -8,7 +8,7 @@ use std::sync::{Arc, Barrier, Mutex};
 use block::VirtioBlockConfig;
 use block::zoned::{
     VIRTIO_BLK_CONFIG_BASE_LEN, VirtioBlockZonedConfig, ZonedExposure, assemble_config_space,
-    config_space_len, gate_features, zoned_negotiated,
+    check_restore_compat, config_space_len, gate_features, zoned_negotiated,
 };
 use log::{error, info};
 use seccompiler::SeccompAction;
@@ -103,10 +103,17 @@ impl Blk {
         ) = if let Some(state) = state {
             info!("Restoring vhost-user-block {id}");
 
-            vu.set_protocol_features_vhost_user(
+            let backend_features = vu.set_protocol_features_vhost_user(
                 state.acked_features,
                 state.acked_protocol_features,
             )?;
+
+            // Refuse the restore outright if the guest was using a zoned device
+            // and this backend cannot serve one. The guest holds zone state and
+            // will keep issuing zone-management commands, and a negotiated
+            // feature cannot be withdrawn from a running guest.
+            check_restore_compat(state.avail_features, backend_features)
+                .map_err(Error::ZonedConfig)?;
 
             vu.restore_state(&state)?;
 
@@ -369,6 +376,13 @@ impl VirtioDevice for Blk {
             kill_evt,
             pause_evt,
         )?;
+
+        // A reconnected backend that no longer offers VIRTIO_BLK_F_ZONED cannot
+        // serve a guest that is already driving zones, so require it to keep
+        // advertising the feature for as long as the device exposes it.
+        if self.zoned.is_some() {
+            handler.required_backend_features |= 1u64 << VIRTIO_BLK_F_ZONED;
+        }
 
         let paused = self.vu_common.virtio_common.paused.clone();
         let paused_sync = self.vu_common.virtio_common.paused_sync.clone();
