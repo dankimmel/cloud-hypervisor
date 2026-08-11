@@ -10,6 +10,7 @@ use std::sync::{Arc, Barrier, Mutex};
 use std::{io, result};
 
 use anyhow::anyhow;
+use block::zoned::ZonedError;
 use event_monitor::event;
 use log::{error, info, warn};
 use seccompiler::SeccompAction;
@@ -179,6 +180,13 @@ pub enum Error {
     EpollWait(#[source] io::Error),
     #[error("Aborted vhost-user connect: kill event received")]
     ConnectKilled,
+    #[error("Backend reported an unusable zoned block device configuration")]
+    ZonedConfig(#[source] ZonedError),
+    #[error(
+        "Reconnected vhost-user backend no longer advertises features \
+         {missing:#x} that the guest has already negotiated (backend advertises {advertised:#x})"
+    )]
+    ReconnectMissingFeatures { missing: u64, advertised: u64 },
 }
 type Result<T> = result::Result<T, Error>;
 
@@ -275,6 +283,9 @@ pub struct VhostUserEpollHandler<S: VhostUserFrontendReqHandler> {
     pub virtio_interrupt: Arc<dyn VirtioInterrupt>,
     pub acked_features: u64,
     pub acked_protocol_features: u64,
+    /// VIRTIO features the guest has negotiated that a reconnected backend must
+    /// still advertise. Zero for devices with no such requirement.
+    pub required_backend_features: u64,
     pub socket_path: String,
     pub server: bool,
     pub backend_req_handler: Option<FrontendReqHandler<S>>,
@@ -357,6 +368,7 @@ impl<S: VhostUserFrontendReqHandler> VhostUserEpollHandler<S> {
                 self.virtio_interrupt.as_ref(),
                 self.acked_features,
                 self.acked_protocol_features,
+                self.required_backend_features,
                 &self.backend_req_handler,
                 self.inflight.as_mut(),
             )
@@ -535,6 +547,7 @@ impl VhostUserCommon {
             virtio_interrupt: interrupt_cb,
             acked_features,
             acked_protocol_features: self.acked_protocol_features,
+            required_backend_features: 0,
             socket_path: self.socket_path.clone(),
             server: self.server,
             backend_req_handler,
